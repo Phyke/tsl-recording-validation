@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+settings.json
+validation_history.json
+validation_history.json.part

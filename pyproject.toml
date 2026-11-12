@@ -1,0 +1,14 @@
+[project]
+name = "tsl-recording-validation"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "av>=19.0.2",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "numpydantic>=1.10.0",
+    "pillow>=13.0.0",
+    "pydantic>=2.14.3",
+    "pyrealsense2>=2.58.0",
+    "pyside6-essentials>=6.12.0",
+]
