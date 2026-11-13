@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,11 @@ from .pydantic_models import (
     Notification,
     Recording,
 )
+from .ros1 import Ros1BagIndex
 from .ros2 import Db3, cdr_string
+
+# the image topic of a stream in a RealSense file: /device_0/sensor_0/Depth_0/image/data or /device_0/sensor_1/Color_0/image/data
+IMAGE_TOPIC = re.compile(r"^/device_\d+/sensor_\d+/(Depth|Color)_\d+/image/data$")
 
 
 def print_device_info(device: rs.device) -> None:
@@ -108,6 +113,22 @@ class RealSenseLoader:
             sensor_options[sensor.get_info(rs.camera_info.name)] = options
         return sensor_options
 
+    # rs.pipeline does not return a frame at the start or the end of the file that has no frame of the other stream at its time,
+    # so the number of image messages comes from the index of the file
+    def read_file_frame_counts(self) -> dict[str, int]:
+        if self.path.suffix == ".db3":
+            db3 = Db3(self.path)
+            topic_counts = {topic: count for topic, (count, _, _) in db3.topic_stats().items()}
+            db3.connection.close()
+        else:
+            topic_counts = Ros1BagIndex(self.path).message_counts
+        counts = {}
+        for topic, count in topic_counts.items():
+            match = IMAGE_TOPIC.match(topic)
+            if match is not None:
+                counts[match[1].lower()] = counts.get(match[1].lower(), 0) + count
+        return counts
+
     def start(self) -> tuple[rs.pipeline, rs.pipeline_profile]:
         pipeline = rs.pipeline()
         config = rs.config()
@@ -194,6 +215,7 @@ class RealSenseLoader:
             depth_to_color=depth_to_color,
             sensor_options=sensor_options,
             notifications=notifications,
+            file_frame_counts=self.read_file_frame_counts(),
             frames=frames,
         )
 

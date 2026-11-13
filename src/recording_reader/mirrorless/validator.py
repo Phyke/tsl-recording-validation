@@ -1,26 +1,44 @@
+import hashlib
 import io
 import itertools
+import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
 from ..pydantic_models import CompressedImageMessage, ValidationIssue
-from ..validator import RecordingValidationError, RecordingValidator
-from .barcode import read_barcode
+from ..validator import MEASURED_FPS_TOLERANCE, RecordingValidationError, RecordingValidator
+from .barcode import BARCODE_JPEG_ROWS, read_barcode
+
+# the mirrorless camera goes through a capture card, which gives no hardware timestamp, so the time is the arrival time of the
+# frame on the clock of the computer
+TIMESTAMP_DOMAIN = "system_time"
 
 
 # -m ROS (.bag) files: mirrorless camera, color only, 1920x1080 at 120 fps
 class MirrorlessRosValidator(RecordingValidator):
     def validate(self, raise_error: bool = True) -> list[ValidationIssue]:
-        issues = self.check_every_frameset_has_stream("color")
+        issues = self.check_notifications()
+        issues += self.check_every_frameset_has_stream("color")
         issues += self.check_no_frameset_has_stream("depth")
-        issues += self.check_stream("color", fps=120, width=1920, height=1080)
+        issues += self.check_frames_loaded("color")
+        issues += self.check_stream("color", fps=120, width=1920, height=1080, timestamp_domain=TIMESTAMP_DOMAIN)
         self.print_measured_fps("color")
         if issues and raise_error:
             raise RecordingValidationError(issues)
         return issues
+
+
+# the format, the size, and the barcode of one JPEG frame, and a digest of the pixels below the barcode: 2 frames with the same
+# camera image have the same digest
+def frame_value(message: CompressedImageMessage) -> dict[str, Any]:
+    image = Image.open(io.BytesIO(message.data))
+    rgb = np.asarray(image.convert("RGB"))
+    digest = hashlib.blake2b(rgb[BARCODE_JPEG_ROWS:], digest_size=16).digest()
+    return {"format": image.format, "size": image.size, "barcode": read_barcode(rgb), "image_digest": digest}
 
 
 # -m ROS2 (.db3) files from poc1 UvcRos2Bag: JPEG frames of the mirrorless camera, 1920x1080 at 120 fps,
@@ -31,12 +49,10 @@ class MirrorlessRos2Validator:
             raise ValueError("no frames")
         self.frames = frames
 
+    # the JPEG decode and the digest release the GIL, so one thread per logical core decodes the frames
     def frame_values(self) -> list[dict[str, Any]]:
-        values = []
-        for message in self.frames:
-            image = Image.open(io.BytesIO(message.data))
-            values.append({"format": image.format, "size": image.size, "barcode": read_barcode(np.asarray(image.convert("RGB")))})
-        return values
+        with ThreadPoolExecutor(os.cpu_count()) as pool:
+            return list(pool.map(frame_value, self.frames))
 
     @staticmethod
     def check_format(values: list[dict[str, Any]]) -> list[ValidationIssue]:
@@ -88,6 +104,18 @@ class MirrorlessRos2Validator:
             issues.append(ValidationIssue(check="barcode_gaps", stream="color", frames=gap_frames, message=message))
         return issues
 
+    # a frame with the same camera image as the previous frame: the capture card gave one image 2 times; the barcode is different,
+    # so only the pixels below the barcode are compared
+    @staticmethod
+    def check_duplicate_images(values: list[dict[str, Any]]) -> list[ValidationIssue]:
+        duplicates = [
+            i for i, (previous, current) in enumerate(itertools.pairwise(values), start=1) if previous["image_digest"] == current["image_digest"]
+        ]
+        if not duplicates:
+            return []
+        message = f"color.frame: the same image as the previous frame in {len(duplicates)} of {len(values)} frames: {duplicates}"
+        return [ValidationIssue(check="duplicate_image", stream="color", frames=duplicates, message=message)]
+
     def check_timestamps(self) -> list[ValidationIssue]:
         issues = []
         for i, (previous, current) in enumerate(itertools.pairwise(self.frames), start=1):
@@ -95,6 +123,19 @@ class MirrorlessRos2Validator:
                 message = f"frame {i} color.stamp_s: {current.stamp_s} <= previous {previous.stamp_s}"
                 issues.append(ValidationIssue(check="timestamp_order", stream="color", frames=[i], message=message))
         return issues
+
+    # the barcode fps is the same value as in print_measured_fps: (last barcode - first barcode) / duration
+    def check_measured_fps(self, values: list[dict[str, Any]], fps: int) -> list[ValidationIssue]:
+        duration_s = self.frames[-1].stamp_s - self.frames[0].stamp_s
+        barcodes = [value["barcode"] for value in values if value["barcode"] is not None]
+        numbered = barcodes[-1] - barcodes[0] if len(barcodes) >= 2 else 0
+        if duration_s <= 0 or numbered <= 0:
+            return []
+        barcode_fps = numbered / duration_s
+        if abs(barcode_fps - fps) <= fps * MEASURED_FPS_TOLERANCE:
+            return []
+        message = f"color.barcode_fps: {barcode_fps:.2f}, expected {fps} within {MEASURED_FPS_TOLERANCE:.0%}"
+        return [ValidationIssue(check="measured_fps", stream="color", message=message)]
 
     # file fps: frames in the file, (frames - 1) / duration
     # barcode fps: frames that the pipeline numbered, (last barcode - first barcode) / duration
@@ -122,6 +163,8 @@ class MirrorlessRos2Validator:
         issues += self.check_size(values, width=1920, height=1080)
         issues += self.check_barcodes(values)
         issues += self.check_timestamps()
+        issues += self.check_measured_fps(values, fps=120)
+        issues += self.check_duplicate_images(values)
         self.print_measured_fps(values)
         if issues and raise_error:
             raise RecordingValidationError(issues)

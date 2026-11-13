@@ -1,8 +1,16 @@
 import itertools
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
+import numpy as np
+
 from .pydantic_models import DepthFrame, Recording, StreamFrame, ValidationIssue
+
+# the camera fps (frame numbers / duration) can differ from the expected fps by this fraction
+MEASURED_FPS_TOLERANCE = 0.01
+# rs.pipeline does not return a frame at the start or the end of the file that has no frame of the other stream at its time;
+# 1 frame of a stream is usual, more frames are an issue
+MAX_UNPAIRED_FRAMES = 1
 
 
 class RecordingValidationError(Exception):
@@ -35,10 +43,11 @@ class RecordingValidator:
 
     def check_every_frameset_has_stream(self, stream_name: str) -> list[ValidationIssue]:
         missing = [i for i, frameset in enumerate(self.recording.frames) if getattr(frameset, stream_name) is None]
-        if not missing:
-            return []
+        # a recording with no framesets has no stream
         if len(missing) == len(self.recording.frames):
             return [ValidationIssue(check="missing_stream", stream=stream_name, message=f"no {stream_name} stream in this recording")]
+        if not missing:
+            return []
         return [
             ValidationIssue(
                 check="missing_frame",
@@ -81,6 +90,34 @@ class RecordingValidator:
                 )
                 issues.append(ValidationIssue(check="size", stream=stream_name, frames=indices, message=message))
         return issues
+
+    @staticmethod
+    def check_timestamp_domain(stream_name: str, frames: list[tuple[int, StreamFrame]], expected: str) -> list[ValidationIssue]:
+        issues = []
+        domain_frames = defaultdict(list)
+        for i, stream_frame in frames:
+            domain_frames[stream_frame.timestamp_domain].append(i)
+        for value, indices in domain_frames.items():
+            if value != expected:
+                message = f"{stream_name}.timestamp_domain: {value} in {len(indices)} of {len(frames)} frames, expected {expected}"
+                issues.append(ValidationIssue(check="timestamp_domain", stream=stream_name, frames=indices, message=message))
+        return issues
+
+    # a frame with the same pixels as the previous frame: the camera or the capture card gave one image 2 times
+    @staticmethod
+    def check_duplicate_images(stream_name: str, frames: list[tuple[int, StreamFrame]]) -> list[ValidationIssue]:
+        duplicates = []
+        for (_, previous), (i, current) in itertools.pairwise(frames):
+            if previous.frame.shape != current.frame.shape:
+                continue
+            # the middle row is compared first, because almost all frames are different there
+            middle = current.frame.shape[0] // 2
+            if np.array_equal(previous.frame[middle], current.frame[middle]) and np.array_equal(previous.frame, current.frame):
+                duplicates.append(i)
+        if not duplicates:
+            return []
+        message = f"{stream_name}.frame: the same image as the previous frame in {len(duplicates)} of {len(frames)} frames: {duplicates}"
+        return [ValidationIssue(check="duplicate_image", stream=stream_name, frames=duplicates, message=message)]
 
     @staticmethod
     def check_constant_values(stream_name: str, frames: list[tuple[int, StreamFrame]]) -> list[ValidationIssue]:
@@ -137,17 +174,63 @@ class RecordingValidator:
                 issues.append(ValidationIssue(check="timestamp_order", stream=stream_name, frames=[i], message=message))
         return issues
 
-    def check_stream(self, stream_name: str, fps: int, width: int, height: int) -> list[ValidationIssue]:
+    # the camera fps is the same value as in print_measured_fps: (last frame number - first frame number) / duration
+    @staticmethod
+    def check_measured_fps(stream_name: str, frames: list[tuple[int, StreamFrame]], fps: int) -> list[ValidationIssue]:
+        first, last = frames[0][1], frames[-1][1]
+        duration_s = (last.timestamp_ms - first.timestamp_ms) / 1000
+        numbered = last.frame_number - first.frame_number
+        if duration_s <= 0 or numbered <= 0:
+            return []
+        camera_fps = numbered / duration_s
+        if abs(camera_fps - fps) <= fps * MEASURED_FPS_TOLERANCE:
+            return []
+        message = f"{stream_name}.camera_fps: {camera_fps:.2f}, expected {fps} within {MEASURED_FPS_TOLERANCE:.0%}"
+        return [ValidationIssue(check="measured_fps", stream=stream_name, message=message)]
+
+    def check_stream(self, stream_name: str, fps: int, width: int, height: int, timestamp_domain: str) -> list[ValidationIssue]:
         frames = self.stream_frames(stream_name)
         if not frames:
             return []
         return (
             self.check_expected_settings(stream_name, frames, fps, width, height)
+            + self.check_timestamp_domain(stream_name, frames, timestamp_domain)
             + self.check_constant_values(stream_name, frames)
             + self.check_metadata_keys(stream_name, frames)
             + self.check_frame_numbers(stream_name, frames)
             + self.check_timestamps(stream_name, frames)
+            + self.check_measured_fps(stream_name, frames, fps)
+            + self.check_duplicate_images(stream_name, frames)
         )
+
+    def check_frames_loaded(self, stream_name: str) -> list[ValidationIssue]:
+        file_count = self.recording.file_frame_counts.get(stream_name)
+        if file_count is None:
+            return []
+        not_loaded = file_count - sum(1 for frameset in self.recording.frames if getattr(frameset, stream_name) is not None)
+        if not_loaded <= MAX_UNPAIRED_FRAMES:
+            return []
+        message = (
+            f"{stream_name}: {not_loaded} of the {file_count} frames in the file are not in the loaded framesets, "
+            f"expected at most {MAX_UNPAIRED_FRAMES}"
+        )
+        return [ValidationIssue(check="frames_not_loaded", stream=stream_name, message=message)]
+
+    # the text that tells the user what to do about a notification; a camera validator gives the text for its camera
+    def notification_advice(self, description: str) -> str:
+        return ""
+
+    # one issue for each different notification, with the number of times that it is in the recording
+    def check_notifications(self) -> list[ValidationIssue]:
+        counts = Counter((n.sensor, n.category, n.severity, n.description) for n in self.recording.notifications)
+        issues = []
+        for (sensor, category, severity, description), count in counts.items():
+            message = f"notification: {description} ({category}, {severity}, {sensor}), {count} time{'s' if count > 1 else ''}"
+            advice = self.notification_advice(description)
+            if advice:
+                message += f". What to do: {advice}"
+            issues.append(ValidationIssue(check="notification", message=message))
+        return issues
 
     # file fps: frames in the file, (frames - 1) / duration
     # camera fps: frames that the camera numbered, (last frame number - first frame number) / duration

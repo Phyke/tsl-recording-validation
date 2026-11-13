@@ -52,6 +52,13 @@ class Db3:
     def topic_names(self) -> list[str]:
         return [name for (name,) in self.connection.execute("SELECT name FROM topics ORDER BY name")]
 
+    # the message count, the first timestamp, and the last timestamp (nanoseconds) of each topic, with no read of the messages
+    def topic_stats(self) -> dict[str, tuple[int, int, int]]:
+        rows = self.connection.execute(
+            "SELECT t.name, count(*), min(m.timestamp), max(m.timestamp) FROM messages m JOIN topics t ON t.id = m.topic_id GROUP BY t.name",
+        )
+        return {name: (count, first, last) for name, count, first, last in rows}
+
     def messages(self, topic: str) -> list[bytes]:
         rows = self.connection.execute(
             "SELECT m.data FROM messages m JOIN topics t ON t.id = m.topic_id WHERE t.name = ? ORDER BY m.timestamp",

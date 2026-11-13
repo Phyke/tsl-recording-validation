@@ -31,6 +31,7 @@ from .pydantic_models import (
     ValidationIssue,
 )
 from .realsense_loader import RealSenseLoader, print_device_info
+from .ros1 import Ros1BagIndex
 from .ros2 import ZSTD_MAGIC, CdrReader, Db3, cdr_string, decompress, key_values
 from .validator import RecordingValidationError, RecordingValidator
 
@@ -61,6 +62,7 @@ __all__ = [
     "Recording",
     "RecordingValidationError",
     "RecordingValidator",
+    "Ros1BagIndex",
     "StreamFrame",
     "ValidationIssue",
     "cdr_string",

@@ -113,6 +113,11 @@ FPS_LINE = re.compile(
 )
 
 
+# "frame 16 " at the start of a message for one frame; the Frames column shows the frame
+FRAME_PREFIX = re.compile(r"^frame \d+ ")
+# the text box below the issue table shows this number of lines; a longer message scrolls
+ISSUE_DETAIL_LINES = 3
+
 # auto_load: load the video when a recording is selected; when False, a click on the player loads it
 DEFAULT_SETTINGS = {"font_point_size": FONT_POINT_SIZE, "auto_load": True}
 
@@ -141,7 +146,19 @@ def run_summary(run: dict[str, Any]) -> str:
         return "critical: validation error"
     if not run["issues"]:
         return "OK"
-    return f"{run_severity(run)}: {len(run['issues'])} issues"
+    count = len(run["issues"])
+    return f"{run_severity(run)}: {count} {'issue' if count == 1 else 'issues'}"
+
+
+# the text of an issue for the Message column: the last line of the message with no frame, stream, or check name at its start,
+# because the other columns show them; the tooltip of the row and the text box show the full message
+def short_message(issue: dict[str, Any]) -> str:
+    text = FRAME_PREFIX.sub("", issue["message"].splitlines()[-1])
+    if issue["stream"]:
+        text = text.removeprefix(f"{issue['stream']}.").removeprefix(f"{issue['stream']}: ")
+    label, separator, rest = text.partition(": ")
+    # "pair duration: ..." is the label of the check pair_duration
+    return rest if separator and label.replace(" ", "_") == issue["check"] else text
 
 
 class History:
@@ -562,6 +579,9 @@ class MainWindow(QMainWindow):
         open_button = QPushButton("Open folder")
         open_button.clicked.connect(self.choose_folder)
         self.recording_list = QListWidget()
+        # a long row is cut at its start, so that the file name and the status stay in view; the tooltip of the row has the full text
+        self.recording_list.setTextElideMode(Qt.TextElideMode.ElideLeft)
+        self.recording_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.recording_list.currentRowChanged.connect(self.select_recording)
         self.validate_selected_button = QPushButton("Validate selected")
         self.validate_selected_button.clicked.connect(self.validate_selected)
@@ -697,9 +717,7 @@ class MainWindow(QMainWindow):
         status_font = QFont(self.status_label.font())
         status_font.setPointSize(round(size * 1.3))
         self.status_label.setFont(status_font)
-        # about 2 lines; a longer message (an error trace) scrolls
-        self.issue_detail.setMaximumHeight(size * 4)
-        # the tables get the new font in the font change events, so their sizes are measured after these events
+        # the tables and the issue text box get the new font in the font change events, so their sizes are measured after these events
         QTimer.singleShot(0, self.refresh_table_sizes)
 
     # the row height follows the font: the font height and the padding that Qt gave the rows at the start
@@ -707,6 +725,9 @@ class MainWindow(QMainWindow):
         for table in [self.fps_table, self.issue_table]:
             header = table.verticalHeader()
             header.setDefaultSectionSize(header.fontMetrics().height() + self.row_padding)
+        # ISSUE_DETAIL_LINES full lines; a longer message (an error trace) scrolls
+        margins = 2 * (self.issue_detail.document().documentMargin() + self.issue_detail.frameWidth())
+        self.issue_detail.setMaximumHeight(round(self.issue_detail.fontMetrics().lineSpacing() * ISSUE_DETAIL_LINES + margins))
         self.show_run(self.run_combo.currentIndex())
 
     def open_settings(self) -> None:
@@ -728,10 +749,14 @@ class MainWindow(QMainWindow):
         self.recordings = find_recordings(folder)
         # a zero-width space after each separator lets a long path wrap
         self.folder_label.setText(str(folder).replace("\\", "\\\u200b").replace("/", "/\u200b"))
+        # clear() sends row changes with rows of the previous list, which are not in the new self.recordings, so the list sends no
+        # signal while it changes
+        self.recording_list.blockSignals(True)
         self.recording_list.clear()
         for path in self.recordings:
             self.recording_list.addItem(QListWidgetItem())
             self.refresh_item(path)
+        self.recording_list.blockSignals(False)
         self.statusBar().showMessage(f"{len(self.recordings)} recordings in {folder}")
         if self.recordings:
             self.recording_list.setCurrentRow(0)
@@ -743,6 +768,7 @@ class MainWindow(QMainWindow):
         runs = self.history.runs(path)
         name = path.relative_to(self.folder).as_posix()
         item.setText(f"{name}  [{run_summary(runs[-1])}]" if runs else name)
+        item.setToolTip(item.text())
         item.setForeground(QColor(STATUS_COLORS[run_severity(runs[-1])]) if runs else self.palette().text().color())
 
     def select_recording(self, row: int) -> None:
@@ -963,7 +989,7 @@ class MainWindow(QMainWindow):
             frames_text = "" if not frames else str(frames[0]) if len(frames) == 1 else f"{len(frames)} frames"
             # the row has the color of its severity, so that the issues that make the file critical are clear
             severity = "critical" if run["error"] else issue_severity(issue, run["issues"])
-            for column, text in enumerate([issue["check"], issue["stream"] or "", frames_text, issue["message"].splitlines()[-1]]):
+            for column, text in enumerate([issue["check"], issue["stream"] or "", frames_text, short_message(issue)]):
                 item = QTableWidgetItem(text)
                 item.setForeground(QColor(STATUS_COLORS[severity]))
                 item.setToolTip(f"{severity}: {issue['message']}")

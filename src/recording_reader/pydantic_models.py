@@ -132,6 +132,9 @@ class Recording(BaseModel):
     depth_to_color: Extrinsics | None = None
     sensor_options: dict[str, dict[str, float]] = Field(default_factory=dict, description="Option values by sensor name, then option name")
     notifications: list[Notification] = Field(default_factory=list)
+    file_frame_counts: dict[str, int] = Field(
+        default_factory=dict, description="Image messages in the file by stream name (depth, color), from the index of the file",
+    )
     frames: list[Frame]
 
     def to_numpy(self, stream_name: str) -> np.ndarray:

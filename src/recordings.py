@@ -16,11 +16,14 @@ from mp4_video import Mp4Video, validate_mp4
 from recording_reader import (
     CompressedImageMessage,
     D435Validator,
+    Db3,
     MirrorlessRos2Loader,
     MirrorlessRos2Validator,
     MirrorlessRosValidator,
     RealSenseLoader,
     Recording,
+    Ros1BagIndex,
+    ValidationIssue,
 )
 
 RECORDING_SUFFIXES = {".bag", ".db3", ".mp4"}
@@ -33,7 +36,8 @@ READ_ERRORS = (OSError, RuntimeError, ValueError, IndexError, av.FFmpegError, sq
 
 # severity: a wrong camera setting or a stream that is not there is critical; the checks that lose frames are medium for 1 or 2
 # lost frames in the file (all the gaps of the check added) and critical for more, but a frame_number_gaps gap at a missing_frame
-# frameset takes the severity of the missing_frame (frame_number_gap_severity); every other check is medium
+# frameset takes the severity of the missing_frame (frame_number_gap_severity); every other check is medium, which includes
+# notification, timestamp_domain, measured_fps, duplicate_image, frames_not_loaded, missing_partner, and pair_duration
 CRITICAL_CHECKS = {"missing_stream", "fps", "size", "format", "serial_number", "unexpected_stream"}
 GAP_CHECKS = {"frame_number_gaps", "barcode_gaps", "timestamp_gaps"}
 MAX_MEDIUM_LOST_FRAMES = 2
@@ -43,14 +47,24 @@ LOST_FRAMES = re.compile(r"(\d+) frame numbers missing|about (\d+) frames missin
 GAP_RANGE = re.compile(r"\[(\d+), (\d+)\]|(\d+)")
 
 
-# every .mp4 file is the mirrorless camera; a .bag or .db3 file has -r (RealSense D435) or -m (mirrorless) in its name
+# -r and -m are camera markers only when no letter or digit follows: 1-m.bag, pipeline-r_20261012_151250.db3, and 1-m-retake.bag
+# have a marker, and the -r of 1-m-retake.bag is not one
+CAMERA_MARKER = re.compile(r"-([rm])(?![A-Za-z0-9])")
+CAMERAS = {"r": "d435", "m": "mirrorless"}
+# the durations of the -r and the -m recording of one take can differ by this time
+MAX_PAIR_DURATION_DIFFERENCE_MS = 1000
+# the image topics of a .db3 file: RealSense (/device_0/sensor_0/Depth_0/image/data) and poc1 UvcRos2Bag
+DB3_IMAGE_TOPIC = re.compile(r"/image/data$|/image_raw/compressed$")
+
+
+# every .mp4 file is the mirrorless camera; a .bag or .db3 file has the marker -r (RealSense D435) or -m (mirrorless) in its name
 def camera_or_none(path: Path) -> str | None:
     if path.suffix == ".mp4":
         return "mirrorless"
-    is_d435, is_mirrorless = "-r" in path.name, "-m" in path.name
-    if is_d435 == is_mirrorless:
+    markers = set(CAMERA_MARKER.findall(path.stem))
+    if len(markers) != 1:
         return None
-    return "d435" if is_d435 else "mirrorless"
+    return CAMERAS[markers.pop()]
 
 
 def camera_of(path: Path) -> str:
@@ -74,13 +88,55 @@ def find_recordings(folder: Path) -> list[Path]:
 # pipeline-r_20261012_151250.db3 and pipeline-m_20261012_151250_color/pipeline-m_20261012_151250_color.db3
 def take_key(path: Path) -> tuple[Path, str]:
     folder = path.parent.parent if path.parent.name == path.stem else path.parent
-    return folder, path.stem.replace("-r", "-x").replace("-m", "-x").removesuffix("_color")
+    return folder, CAMERA_MARKER.sub("-x", path.stem).removesuffix("_color")
 
 
 def find_partner(path: Path, recordings: list[Path]) -> Path | None:
     camera = camera_or_none(path)
     partners = [other for other in recordings if camera_or_none(other) not in {None, camera} and take_key(other) == take_key(path)]
     return partners[0] if partners else None
+
+
+# the recordings in the folder of the take and in its direct subfolders (a -m .db3 file is in its own subfolder)
+def take_recordings(path: Path) -> list[Path]:
+    folder = take_key(path)[0]
+    return [other for pattern in ("*", "*/*") for other in folder.glob(pattern) if other.suffix in RECORDING_SUFFIXES and other.is_file()]
+
+
+# the time from the first image to the last image, from the index of the file with no read of the images
+def recording_duration_ms(path: Path) -> float:
+    if path.suffix == ".mp4":
+        return float(Mp4Video(path).times_ms[-1])
+    if path.suffix == ".bag":
+        return Ros1BagIndex(path).duration_ms
+    db3 = Db3(path)
+    spans = [(first, last) for topic, (_, first, last) in db3.topic_stats().items() if DB3_IMAGE_TOPIC.search(topic)]
+    db3.connection.close()
+    if not spans:
+        raise ValueError(f"{path.name}: no image topic")
+    return (max(last for _, last in spans) - min(first for first, _ in spans)) / 1e6
+
+
+# the checks of the 2 recordings of one take: the other recording is there, and the 2 durations agree
+def pair_issues(path: Path, loaded: Loaded | None = None) -> list[ValidationIssue]:
+    camera = camera_of(path)
+    partner = find_partner(path, take_recordings(path))
+    if partner is None:
+        wanted = "-m (mirrorless)" if camera == "d435" else "-r (RealSense D435)"
+        return [ValidationIssue(check="missing_partner", message=f"no {wanted} recording of this take next to {path.name}")]
+    duration_ms = float(loaded.times_ms[-1]) if isinstance(loaded, Mp4Video) else recording_duration_ms(path)
+    try:
+        partner_duration_ms = recording_duration_ms(partner)
+    except READ_ERRORS as error:
+        return [ValidationIssue(check="pair_duration", message=f"pair duration: {partner.name} cannot be read: {error}")]
+    difference_ms = duration_ms - partner_duration_ms
+    if abs(difference_ms) <= MAX_PAIR_DURATION_DIFFERENCE_MS:
+        return []
+    message = (
+        f"pair duration: {path.name} {duration_ms / 1000:.3f} s, {partner.name} {partner_duration_ms / 1000:.3f} s, "
+        f"difference {difference_ms:+.0f} ms, expected within {MAX_PAIR_DURATION_DIFFERENCE_MS} ms"
+    )
+    return [ValidationIssue(check="pair_duration", message=message)]
 
 
 def lost_frames(issue: dict[str, Any]) -> int | None:
@@ -152,6 +208,7 @@ def load_recording(path: Path) -> Loaded:
 def validate_recording(path: Path, loaded: Loaded) -> dict[str, Any]:
     if isinstance(loaded, Mp4Video):
         fps_lines, issues = validate_mp4(loaded)
+        issues += pair_issues(path, loaded)
         return {"fps": fps_lines, "issues": [issue.model_dump(mode="json") for issue in issues], "error": None}
     printed = io.StringIO()
     with contextlib.redirect_stdout(printed):
@@ -161,6 +218,7 @@ def validate_recording(path: Path, loaded: Loaded) -> dict[str, Any]:
             issues = D435Validator(loaded).validate(raise_error=False)
         else:
             issues = MirrorlessRosValidator(loaded).validate(raise_error=False)
+    issues += pair_issues(path)
     return {"fps": printed.getvalue().splitlines(), "issues": [issue.model_dump(mode="json") for issue in issues], "error": None}
 
 
