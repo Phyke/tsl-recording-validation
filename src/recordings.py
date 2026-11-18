@@ -1,9 +1,13 @@
 import contextlib
+import csv
 import io
+import json
 import re
 import sqlite3
+import statistics
 import struct
 import traceback
+from collections.abc import Callable
 from compression import zstd
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +28,7 @@ from recording_reader import (
     Recording,
     Ros1BagIndex,
     ValidationIssue,
+    measure,
 )
 
 RECORDING_SUFFIXES = {".bag", ".db3", ".mp4"}
@@ -36,8 +41,9 @@ READ_ERRORS = (OSError, RuntimeError, ValueError, IndexError, av.FFmpegError, sq
 
 # severity: a wrong camera setting or a stream that is not there is critical; the checks that lose frames are medium for 1 or 2
 # lost frames in the file (all the gaps of the check added) and critical for more, but a frame_number_gaps gap at a missing_frame
-# frameset takes the severity of the missing_frame (frame_number_gap_severity); every other check is medium, which includes
-# notification, timestamp_domain, measured_fps, duplicate_image, frames_not_loaded, missing_partner, and pair_duration
+# frameset takes the severity of the missing_frame (frame_number_gap_severity); a duplicate_image frame is a lost image, so it follows
+# the same count rule; every other check is medium, which includes notification, timestamp_domain, measured_fps, image_fps,
+# frames_not_loaded, missing_partner, pair_duration, report_no_frame_drops, and dropped_capture_frames
 CRITICAL_CHECKS = {"missing_stream", "fps", "size", "format", "serial_number", "unexpected_stream"}
 GAP_CHECKS = {"frame_number_gaps", "barcode_gaps", "timestamp_gaps"}
 MAX_MEDIUM_LOST_FRAMES = 2
@@ -47,30 +53,30 @@ LOST_FRAMES = re.compile(r"(\d+) frame numbers missing|about (\d+) frames missin
 GAP_RANGE = re.compile(r"\[(\d+), (\d+)\]|(\d+)")
 
 
-# -r and -m are camera markers only when no letter or digit follows: 1-m.bag, pipeline-r_20261012_151250.db3, and 1-m-retake.bag
-# have a marker, and the -r of 1-m-retake.bag is not one
-CAMERA_MARKER = re.compile(r"-([rm])(?![A-Za-z0-9])")
+# r and m are camera markers at the start of the name or after a "-", and only when no letter or digit follows: 1-m.bag,
+# pipeline-r_20261012_151250.db3, r_20261113_134220.db3, -m_20261113_143019.mp4, and 1-m-retake.bag have a marker, and the -r of
+# 1-m-retake.bag is not one
+CAMERA_MARKER = re.compile(r"(?:^|-)([rm])(?![A-Za-z0-9])")
 CAMERAS = {"r": "d435", "m": "mirrorless"}
+CAMERA_LABELS = {"d435": "D435", "mirrorless": "mirrorless"}
 # the durations of the -r and the -m recording of one take can differ by this time
 MAX_PAIR_DURATION_DIFFERENCE_MS = 1000
 # the image topics of a .db3 file: RealSense (/device_0/sensor_0/Depth_0/image/data) and poc1 UvcRos2Bag
 DB3_IMAGE_TOPIC = re.compile(r"/image/data$|/image_raw/compressed$")
 
 
-# every .mp4 file is the mirrorless camera; a .bag or .db3 file has the marker -r (RealSense D435) or -m (mirrorless) in its name
+# a file has the marker r (RealSense D435) or m (mirrorless) in its name; an .mp4 file with no marker is the mirrorless camera
 def camera_or_none(path: Path) -> str | None:
-    if path.suffix == ".mp4":
-        return "mirrorless"
     markers = set(CAMERA_MARKER.findall(path.stem))
-    if len(markers) != 1:
-        return None
-    return CAMERAS[markers.pop()]
+    if len(markers) == 1:
+        return CAMERAS[markers.pop()]
+    return "mirrorless" if path.suffix == ".mp4" and not markers else None
 
 
 def camera_of(path: Path) -> str:
     camera = camera_or_none(path)
     if camera is None:
-        raise ValueError(f"{path.name}: the file name must contain exactly one of -r (RealSense D435) and -m (mirrorless)")
+        raise ValueError(f"{path.name}: the file name must contain exactly one of the markers r (RealSense D435) and m (mirrorless)")
     return camera
 
 
@@ -84,17 +90,68 @@ def find_recordings(folder: Path) -> list[Path]:
     return sorted(paths, key=lambda path: natural_key(path.relative_to(folder).as_posix()))
 
 
-# the -r and -m recordings of one take have the same key: 1-r.bag and 1-m.bag (or 1-m.mp4) in one folder, or
-# pipeline-r_20261012_151250.db3 and pipeline-m_20261012_151250_color/pipeline-m_20261012_151250_color.db3
+# the recordings of one take have the same key: 1-r.bag and 1-m.bag (or 1-m.mp4) in one folder, or r_20261113_134220.db3,
+# r_20261113_134220.mp4, m_20261113_134220.mp4, and m_20261113_134220_color/m_20261113_134220_color.db3 (a mirrorless .db3 file
+# is in a subfolder with its own name)
 def take_key(path: Path) -> tuple[Path, str]:
     folder = path.parent.parent if path.parent.name == path.stem else path.parent
     return folder, CAMERA_MARKER.sub("-x", path.stem).removesuffix("_color")
 
 
+# the name of the take of a file for the list of the app: the file name with no camera marker, no _color, and no suffix:
+# 20261113_144012 for m_20261113_144012_color.db3, pipeline_20261012_151250 for pipeline-r_20261012_151250.db3, 1 for 1-m.bag
+def take_label(path: Path) -> str:
+    return CAMERA_MARKER.sub("", path.stem.removesuffix("_color")).strip("-_") or path.stem
+
+
+# the name of a file under its take in the list of the app: the camera and the file type; a file with no camera marker keeps its name
+def file_label(path: Path) -> str:
+    camera = camera_or_none(path)
+    return f"{CAMERA_LABELS[camera]} {path.suffix}" if camera is not None else path.name
+
+
+# the takes of the recordings, in the order of their first file: (label, files of the take); the label of a take in a subfolder
+# starts with the subfolder, because 2 subfolders can have a take with the same name (1-m.bag)
+def group_takes(folder: Path, recordings: list[Path]) -> list[tuple[str, list[Path]]]:
+    takes: dict[tuple[Path, str], list[Path]] = {}
+    for path in recordings:
+        takes.setdefault(take_key(path), []).append(path)
+    groups = []
+    for (take_folder, _), paths in takes.items():
+        relative = take_folder.relative_to(folder).as_posix()
+        label = take_label(paths[0])
+        groups.append((label if relative == "." else f"{relative}/{label}", paths))
+    return groups
+
+
+# the recordings of one camera in the take of path; the files of the type of path are first: an .mp4 file for an .mp4 file, and a
+# .bag or .db3 file for a .bag or .db3 file
+def take_files(path: Path, recordings: list[Path], camera: str) -> list[Path]:
+    files = [other for other in recordings if camera_or_none(other) == camera and take_key(other) == take_key(path)]
+    return sorted(files, key=lambda other: (other.suffix == ".mp4") != (path.suffix == ".mp4"))
+
+
+# the recording of the other camera in the take of path, of the same file type when the take has one
 def find_partner(path: Path, recordings: list[Path]) -> Path | None:
     camera = camera_or_none(path)
-    partners = [other for other in recordings if camera_or_none(other) not in {None, camera} and take_key(other) == take_key(path)]
+    if camera is None:
+        return None
+    partners = take_files(path, recordings, "mirrorless" if camera == "d435" else "d435")
     return partners[0] if partners else None
+
+
+# the 2 recordings for the cross-correlation of the take of path: the D435 .bag or .db3 file (a D435 .mp4 file has no depth and no
+# absolute time), then the mirrorless recording when the take has one; None when the take has no D435 .bag or .db3 file
+def correlation_pair(path: Path, recordings: list[Path]) -> list[Path] | None:
+    camera = camera_or_none(path)
+    if camera is None:
+        return None
+    d435_files = [other for other in take_files(path, recordings, "d435") if other.suffix != ".mp4"]
+    if not d435_files:
+        return None
+    d435 = path if path in d435_files else d435_files[0]
+    mirrorless = path if camera == "mirrorless" else find_partner(path, recordings)
+    return [d435] if mirrorless is None else [d435, mirrorless]
 
 
 # the recordings in the folder of the take and in its direct subfolders (a -m .db3 file is in its own subfolder)
@@ -139,8 +196,63 @@ def pair_issues(path: Path, loaded: Loaded | None = None) -> list[ValidationIssu
     return [ValidationIssue(check="pair_duration", message=message)]
 
 
+# poc1 writes meta/<take>.report.json and meta/<take>_sysmon.csv in the folder of the take; <take> is the file name with no suffix and
+# no _color: m_20261113_144012 for m_20261113_144012_color/m_20261113_144012_color.db3; a RealSense Viewer file has no meta file
+def meta_path(path: Path, suffix: str) -> Path:
+    return take_key(path)[0] / "meta" / f"{path.stem.removesuffix('_color')}{suffix}"
+
+
+# the checks of the poc1 report against the file: copies is the number of duplicate_image frames, None for an .mp4 file (its
+# check has no copy count); dropped_capture_frames is in the reports of the recorder that counts the ffmpeg drop warnings
+def report_issues(path: Path, copies: int | None) -> list[ValidationIssue]:
+    report_path = meta_path(path, ".report.json")
+    if not report_path.is_file():
+        return []
+    try:
+        report = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        return [ValidationIssue(check="report", message=f"report: {report_path.name} cannot be read: {error}")]
+    issues = []
+    if report.get("no_frame_drops") is True and copies:
+        message = f"report: no_frame_drops is true in {report_path.name}, but {copies} frames are copies of the previous image"
+        issues.append(ValidationIssue(check="report_no_frame_drops", message=message))
+    dropped = report.get("dropped_capture_frames")
+    if dropped:
+        message = f"report: ffmpeg dropped {dropped} capture frames (dropped_capture_frames in {report_path.name})"
+        issues.append(ValidationIssue(check="dropped_capture_frames", message=message))
+    return issues
+
+
+# the CPU median and the total RAM of the PC during the take, from the poc1 sysmon file; the first row is not in the CPU median,
+# because psutil.cpu_percent(interval=None) gives the time since an earlier call (or 0.0 at the first call), not 1 second
+def sysmon_measures(path: Path) -> list[dict[str, str]]:
+    sysmon_path = meta_path(path, "_sysmon.csv")
+    if not sysmon_path.is_file():
+        return []
+    try:
+        rows = list(csv.DictReader(sysmon_path.open(newline="")))
+        cpu = [float(row["cpu_percent"]) for row in rows[1:]]
+        ram_gb = [float(row["ram_used_mb"]) / float(row["ram_percent"]) * 100 / 1024 for row in rows if float(row["ram_percent"]) > 0]
+    except (OSError, KeyError, ValueError) as error:
+        return [measure("PC", "sysmon", f"{sysmon_path.name} cannot be read: {error}")]
+    if not cpu or not ram_gb:
+        return [measure("PC", "sysmon", f"not available, {len(rows)} rows in {sysmon_path.name}")]
+    return [
+        measure("PC", "CPU median", f"{statistics.median(cpu):.1f}% in {len(cpu)} samples"),
+        measure("PC", "total RAM", f"{statistics.median(ram_gb):.1f} GB"),
+    ]
+
+
+# the sysmon measures as one text line, as the validators print their measures
+def sysmon_lines(path: Path) -> list[str]:
+    measures = sysmon_measures(path)
+    if not measures:
+        return []
+    return ["sysmon: " + ", ".join(f"{row['name']} {row['value']}" for row in measures)]
+
+
 def lost_frames(issue: dict[str, Any]) -> int | None:
-    if issue["check"] == "missing_frame":
+    if issue["check"] in ("missing_frame", "duplicate_image"):
         return len(issue["frames"])
     if issue["check"] not in GAP_CHECKS:
         return None
@@ -196,37 +308,47 @@ def run_severity(run: dict[str, Any]) -> str:
     return "medium" if severities else "OK"
 
 
-def load_recording(path: Path) -> Loaded:
+# should_stop: True stops the read of a RealSense file with LoadCancelled; the 2 other loads are short and do not ask
+def load_recording(path: Path, should_stop: Callable[[], bool] | None = None) -> Loaded:
     if path.suffix == ".mp4":
         return Mp4Video(path)
     if camera_of(path) == "mirrorless" and path.suffix == ".db3":
         return MirrorlessRos2Loader(path).load()
-    return RealSenseLoader(path, forward_fill=False).load()
+    return RealSenseLoader(path, forward_fill=False).load(should_stop)
 
 
-# the validators print the measured fps; the printed lines are kept with the issues
+# the validators print the measured fps and return the measures; the printed lines ("fps") and the measures are kept with the issues
 def validate_recording(path: Path, loaded: Loaded) -> dict[str, Any]:
     if isinstance(loaded, Mp4Video):
-        fps_lines, issues = validate_mp4(loaded)
-        issues += pair_issues(path, loaded)
-        return {"fps": fps_lines, "issues": [issue.model_dump(mode="json") for issue in issues], "error": None}
-    printed = io.StringIO()
-    with contextlib.redirect_stdout(printed):
+        fps_lines, issues, measures = validate_mp4(loaded, camera_of(path))
+        issues += pair_issues(path, loaded) + report_issues(path, copies=None)
+    else:
         if isinstance(loaded, list):
-            issues = MirrorlessRos2Validator(loaded).validate(raise_error=False)
+            validator = MirrorlessRos2Validator(loaded)
         elif camera_of(path) == "d435":
-            issues = D435Validator(loaded).validate(raise_error=False)
+            validator = D435Validator(loaded)
         else:
-            issues = MirrorlessRosValidator(loaded).validate(raise_error=False)
-    issues += pair_issues(path)
-    return {"fps": printed.getvalue().splitlines(), "issues": [issue.model_dump(mode="json") for issue in issues], "error": None}
+            validator = MirrorlessRosValidator(loaded)
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            issues = validator.validate(raise_error=False)
+        fps_lines, measures = printed.getvalue().splitlines(), validator.measures
+        copies = sum(len(issue.frames) for issue in issues if issue.check == "duplicate_image" and issue.stream == "color")
+        issues += pair_issues(path) + report_issues(path, copies)
+    return {
+        "fps": fps_lines + sysmon_lines(path),
+        "measures": measures + sysmon_measures(path),
+        "issues": [issue.model_dump(mode="json") for issue in issues],
+        "error": None,
+    }
 
 
 # the motion signal for the cross-correlation; an .mp4 file needs a decode of every frame, so it is made only on request
-def motion_of(path: Path, loaded: Loaded) -> dict:
+# should_stop: True stops the work with LoadCancelled
+def motion_of(path: Path, loaded: Loaded, should_stop: Callable[[], bool] | None = None) -> dict:
     if camera_of(path) == "d435":
-        return d435_motion(loaded)
-    return mirrorless_motion(loaded)
+        return d435_motion(loaded, should_stop)
+    return mirrorless_motion(loaded, should_stop)
 
 
 def validation_run(path: Path, loaded: Loaded) -> dict[str, Any]:
@@ -234,7 +356,7 @@ def validation_run(path: Path, loaded: Loaded) -> dict[str, Any]:
     try:
         return run | validate_recording(path, loaded)
     except READ_ERRORS:
-        return run | {"fps": [], "issues": [], "error": traceback.format_exc()}
+        return run | {"fps": [], "measures": [], "issues": [], "error": traceback.format_exc()}
 
 
 # one file of Validate all, from one load: the run for the history, and the motion signal for the cross-correlation (None for an
@@ -244,7 +366,7 @@ def validate_file(path: Path) -> tuple[dict[str, Any], dict | None]:
         loaded = load_recording(path)
     except READ_ERRORS:
         run = {"validated_at": datetime.now().isoformat(timespec="seconds")}
-        return run | {"fps": [], "issues": [], "error": traceback.format_exc()}, None
+        return run | {"fps": [], "measures": [], "issues": [], "error": traceback.format_exc()}, None
     run = validation_run(path, loaded)
     if isinstance(loaded, Mp4Video):
         return run, None

@@ -10,7 +10,14 @@ import numpy as np
 from PIL import Image
 
 from ..pydantic_models import CompressedImageMessage, ValidationIssue
-from ..validator import MEASURED_FPS_TOLERANCE, RecordingValidationError, RecordingValidator
+from ..validator import (
+    MEASURED_FPS_TOLERANCE,
+    RecordingValidationError,
+    RecordingValidator,
+    check_image_fps,
+    measure,
+    print_image_runs,
+)
 from .barcode import BARCODE_JPEG_ROWS, read_barcode
 
 # the mirrorless camera goes through a capture card, which gives no hardware timestamp, so the time is the arrival time of the
@@ -25,8 +32,13 @@ class MirrorlessRosValidator(RecordingValidator):
         issues += self.check_every_frameset_has_stream("color")
         issues += self.check_no_frameset_has_stream("depth")
         issues += self.check_frames_loaded("color")
-        issues += self.check_stream("color", fps=120, width=1920, height=1080, timestamp_domain=TIMESTAMP_DOMAIN)
-        self.print_measured_fps("color")
+        stream_issues = self.check_stream("color", fps=120, width=1920, height=1080, timestamp_domain=TIMESTAMP_DOMAIN)
+        issues += stream_issues
+        copies = next((issue.frames for issue in stream_issues if issue.check == "duplicate_image"), [])
+        frames = self.stream_frames("color")
+        duration_s = (frames[-1][1].timestamp_ms - frames[0][1].timestamp_ms) / 1000 if frames else 0
+        issues += check_image_fps("color", len(frames), copies, duration_s, fps=120)
+        self.measures = self.print_measured_fps("color") + print_image_runs("color", [i for i, _ in frames], copies, duration_s)
         if issues and raise_error:
             raise RecordingValidationError(issues)
         return issues
@@ -48,6 +60,8 @@ class MirrorlessRos2Validator:
         if not frames:
             raise ValueError("no frames")
         self.frames = frames
+        # the measures of the last validate(), for the Measures table of the app
+        self.measures: list[dict[str, str]] = []
 
     # the JPEG decode and the digest release the GIL, so one thread per logical core decodes the frames
     def frame_values(self) -> list[dict[str, Any]]:
@@ -140,22 +154,27 @@ class MirrorlessRos2Validator:
     # file fps: frames in the file, (frames - 1) / duration
     # barcode fps: frames that the pipeline numbered, (last barcode - first barcode) / duration
     # kept: frames in the file as a percentage of the frames that the pipeline numbered
-    def print_measured_fps(self, values: list[dict[str, Any]]) -> None:
+    def print_measured_fps(self, values: list[dict[str, Any]]) -> list[dict[str, str]]:
         duration_s = self.frames[-1].stamp_s - self.frames[0].stamp_s
         if duration_s <= 0:
             print(f"color: measured fps not available, {len(self.frames)} frames in {duration_s} s")
-            return
+            return [measure("color", "file fps", f"not available, {len(self.frames)} frames in {duration_s} s")]
         file_fps = (len(self.frames) - 1) / duration_s
         barcodes = [value["barcode"] for value in values if value["barcode"] is not None]
         numbered = barcodes[-1] - barcodes[0] if len(barcodes) >= 2 else 0
+        measures = [measure("color", "file fps", f"{file_fps:.2f}")]
         if numbered <= 0:
             print(f"color: file fps {file_fps:.2f}, barcode fps not available, barcodes do not increase")
-            return
-        barcode_fps = numbered / duration_s
-        kept = (len(barcodes) - 1) / numbered * 100
-        print(
-            f"color: file fps {file_fps:.2f}, barcode fps {barcode_fps:.2f}, kept {kept:.1f}%, {len(self.frames)} frames in {duration_s:.3f} s"
-        )
+            measures.append(measure("color", "barcode fps", "not available, barcodes do not increase"))
+        else:
+            barcode_fps = numbered / duration_s
+            kept = (len(barcodes) - 1) / numbered * 100
+            print(
+                f"color: file fps {file_fps:.2f}, barcode fps {barcode_fps:.2f}, kept {kept:.1f}%, {len(self.frames)} frames in "
+                f"{duration_s:.3f} s"
+            )
+            measures += [measure("color", "barcode fps", f"{barcode_fps:.2f}"), measure("color", "kept", f"{kept:.1f}%")]
+        return measures + [measure("color", "frames", str(len(self.frames))), measure("color", "duration", f"{duration_s:.3f} s")]
 
     def validate(self, raise_error: bool = True) -> list[ValidationIssue]:
         values = self.frame_values()
@@ -164,8 +183,12 @@ class MirrorlessRos2Validator:
         issues += self.check_barcodes(values)
         issues += self.check_timestamps()
         issues += self.check_measured_fps(values, fps=120)
-        issues += self.check_duplicate_images(values)
-        self.print_measured_fps(values)
+        duplicate_issues = self.check_duplicate_images(values)
+        issues += duplicate_issues
+        copies = duplicate_issues[0].frames if duplicate_issues else []
+        duration_s = self.frames[-1].stamp_s - self.frames[0].stamp_s
+        issues += check_image_fps("color", len(values), copies, duration_s, fps=120)
+        self.measures = self.print_measured_fps(values) + print_image_runs("color", list(range(len(values))), copies, duration_s)
         if issues and raise_error:
             raise RecordingValidationError(issues)
         return issues

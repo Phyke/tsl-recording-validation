@@ -30,10 +30,10 @@ from .pydantic_models import (
     StreamFrame,
     ValidationIssue,
 )
-from .realsense_loader import RealSenseLoader, print_device_info
+from .realsense_loader import LoadCancelled, RealSenseLoader, print_device_info
 from .ros1 import Ros1BagIndex
 from .ros2 import ZSTD_MAGIC, CdrReader, Db3, cdr_string, decompress, key_values
-from .validator import RecordingValidationError, RecordingValidator
+from .validator import RecordingValidationError, RecordingValidator, measure
 
 __all__ = [
     "BARCODE_BITS",
@@ -52,6 +52,7 @@ __all__ = [
     "Extrinsics",
     "Frame",
     "Intrinsics",
+    "LoadCancelled",
     "MirrorlessRos2Loader",
     "MirrorlessRos2Validator",
     "MirrorlessRosValidator",
@@ -69,6 +70,7 @@ __all__ = [
     "decode_jpeg",
     "decompress",
     "key_values",
+    "measure",
     "parse_compressed_image",
     "print_device_info",
     "read_barcode",

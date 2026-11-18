@@ -4,10 +4,10 @@ from pathlib import Path
 import av
 import numpy as np
 
-from recording_reader import ValidationIssue
+from recording_reader import ValidationIssue, measure
 
-# an .mp4 file is checked as the mirrorless camera, as in MirrorlessRosValidator
-EXPECTED_WIDTH, EXPECTED_HEIGHT, EXPECTED_FPS = 1920, 1080, 120
+# the expected width, height, and fps of an .mp4 file of each camera, as in D435Validator and MirrorlessRosValidator
+EXPECTED = {"d435": (640, 480, 30), "mirrorless": (1920, 1080, 120)}
 # a frame up to this many frames after the next one is reached by a decode forward, which is faster than a seek
 MAX_DECODE_AHEAD = 240
 
@@ -58,22 +58,23 @@ class Mp4Video:
                     yield (frame.pts - self.pts[0]) * time_base * 1000, frame.to_ndarray(format="rgb24")
 
 
-# the mirrorless checks of an .mp4 file: size, declared fps, frames with the same time, and gaps longer than 1.5 frame periods;
-# returns the measured fps lines and the issues
-def validate_mp4(video: Mp4Video) -> tuple[list[str], list[ValidationIssue]]:
+# the checks of an .mp4 file of the camera ("d435" or "mirrorless"): size, declared fps, frames with the same time, and gaps longer
+# than 1.5 frame periods; returns the measured fps lines, the issues, and the measures
+def validate_mp4(video: Mp4Video, camera: str) -> tuple[list[str], list[ValidationIssue], list[dict[str, str]]]:
+    expected_width, expected_height, expected_fps = EXPECTED[camera]
     issues = []
-    if (video.width, video.height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
-        message = f"color.size: {video.width}x{video.height}, expected {EXPECTED_WIDTH}x{EXPECTED_HEIGHT}"
+    if (video.width, video.height) != (expected_width, expected_height):
+        message = f"color.size: {video.width}x{video.height}, expected {expected_width}x{expected_height}"
         issues.append(ValidationIssue(check="size", stream="color", message=message))
-    if not np.isfinite(video.declared_fps) or round(video.declared_fps) != EXPECTED_FPS:
-        message = f"color.fps: {video.declared_fps:.2f} in the file header, expected {EXPECTED_FPS}"
+    if not np.isfinite(video.declared_fps) or round(video.declared_fps) != expected_fps:
+        message = f"color.fps: {video.declared_fps:.2f} in the file header, expected {expected_fps}"
         issues.append(ValidationIssue(check="fps", stream="color", message=message))
     intervals = np.diff(video.times_ms)
     same_time = (np.flatnonzero(intervals <= 0) + 1).tolist()
     if same_time:
         message = f"color.timestamp: {len(same_time)} frames with the same time as the previous frame"
         issues.append(ValidationIssue(check="timestamp_order", stream="color", frames=same_time, message=message))
-    period_ms = 1000 / EXPECTED_FPS
+    period_ms = 1000 / expected_fps
     gaps = np.flatnonzero(intervals > 1.5 * period_ms)
     if gaps.size:
         missing = int(np.round(intervals[gaps] / period_ms).sum()) - gaps.size
@@ -81,5 +82,12 @@ def validate_mp4(video: Mp4Video) -> tuple[list[str], list[ValidationIssue]]:
         issues.append(ValidationIssue(check="timestamp_gaps", stream="color", frames=(gaps + 1).tolist(), message=message))
     duration_s = (video.times_ms[-1] - video.times_ms[0]) / 1000
     if duration_s <= 0:
-        return [f"color: measured fps not available, {len(video)} frames in {duration_s} s"], issues
-    return [f"color: file fps {(len(video) - 1) / duration_s:.2f}, {len(video)} frames in {duration_s:.3f} s"], issues
+        reason = f"{len(video)} frames in {duration_s} s"
+        return [f"color: measured fps not available, {reason}"], issues, [measure("color", "file fps", f"not available, {reason}")]
+    file_fps = (len(video) - 1) / duration_s
+    measures = [
+        measure("color", "file fps", f"{file_fps:.2f}"),
+        measure("color", "frames", str(len(video))),
+        measure("color", "duration", f"{duration_s:.3f} s"),
+    ]
+    return [f"color: file fps {file_fps:.2f}, {len(video)} frames in {duration_s:.3f} s"], issues, measures

@@ -64,6 +64,14 @@ def test_same_image_as_the_previous_frame_is_an_issue() -> None:
     assert [(issue.check, issue.stream, issue.frames) for issue in issues] == [("duplicate_image", "color", [3, 5])]
 
 
+def test_mirrorless_copies_give_a_low_image_fps() -> None:
+    recording = mirrorless_recording()
+    recording.frames[2].color.frame = recording.frames[1].color.frame.copy()
+    issues = MirrorlessRosValidator(recording).validate(raise_error=False)
+    assert [(issue.check, issue.stream, issue.frames) for issue in issues] == [("duplicate_image", "color", [2]), ("image_fps", "color", [])]
+    assert issues[1].message == "color.image_fps: 80.00 (3 different images in 4 frames), expected 120 within 1%"
+
+
 def test_frames_of_the_file_that_are_not_loaded() -> None:
     recording = d435_recording()
     recording.file_frame_counts = {"depth": 7, "color": 6}

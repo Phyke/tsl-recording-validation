@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -14,6 +15,13 @@ import app
 @pytest.fixture(scope="module")
 def application() -> QApplication:
     return QApplication.instance() or QApplication([])
+
+
+# the app writes the last folder and the last runs; the tests use files in tmp_path, not the files of the repository
+@pytest.fixture(autouse=True)
+def app_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(app, "HISTORY_PATH", tmp_path / "validation_history.json")
 
 
 def make_folder(folder: Path, names: list[str]) -> Path:
@@ -49,7 +57,7 @@ def test_short_message_has_no_part_that_a_column_shows(check: str, stream: str |
 
 
 def test_open_a_second_folder_with_fewer_recordings(application: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # with 108 recordings and row 106, QListWidget.clear() sends a row change for row 54
+    # clear() of the list can send an item change for an item of the previous folder
     large = make_folder(tmp_path / "large", [f"{n}-r.bag" for n in range(1, 109)])
     small = make_folder(tmp_path / "small", [f"{n}-r.bag" for n in range(1, 11)])
     # Qt gives an exception in a slot to sys.excepthook and continues
@@ -58,10 +66,134 @@ def test_open_a_second_folder_with_fewer_recordings(application: QApplication, t
     window = app.MainWindow(None)
     window.settings["auto_load"] = False
     window.open_folder(large)
-    window.recording_list.setCurrentRow(106)
+    window.select_path(window.recordings[106])
     window.open_folder(small)
     assert errors == []
-    assert window.recording_list.count() == 10
-    assert window.recording_list.currentRow() == 0
+    assert window.recording_list.topLevelItemCount() == 10
+    assert window.recording_list.currentItem() is window.recording_items[window.recordings[0]]
     assert window.requested == window.recordings[0]
+    window.close()
+
+
+# a poc1 take with 4 files (the mirrorless .db3 file in its own subfolder) and a take in a subfolder
+def test_the_list_has_one_item_for_each_take_with_its_files(application: QApplication, tmp_path: Path) -> None:
+    folder = make_folder(tmp_path / "takes", ["m_20261113_144012.mp4", "r_20261113_144012.db3", "r_20261113_144012.mp4"])
+    (folder / "m_20261113_144012_color").mkdir()
+    (folder / "m_20261113_144012_color" / "m_20261113_144012_color.db3").touch()
+    (folder / "station_a").mkdir()
+    for name in ["1-m.bag", "1-r.bag"]:
+        (folder / "station_a" / name).touch()
+    window = app.MainWindow(None)
+    window.settings["auto_load"] = False
+    window.open_folder(folder)
+    takes = [window.recording_list.topLevelItem(i) for i in range(window.recording_list.topLevelItemCount())]
+    assert [take.text(0) for take in takes] == ["20261113_144012", "station_a/1"]
+    files = sorted(takes[0].child(i).text(0) for i in range(takes[0].childCount()))
+    assert files == ["D435 .db3", "D435 .mp4", "mirrorless .db3", "mirrorless .mp4"]
+    # the first file is selected and its take is open; a click on a take opens or closes it and selects no file
+    assert takes[0].isExpanded()
+    assert not takes[1].isExpanded()
+    selected = window.requested
+    window.toggle_take(takes[1])
+    window.recording_list.setCurrentItem(takes[1])
+    assert takes[1].isExpanded()
+    assert window.requested == selected
+    window.recording_list.setCurrentItem(takes[1].child(0))
+    assert window.requested == folder / "station_a" / "1-m.bag"
+    window.close()
+
+
+def test_the_last_folder_opens_at_the_next_start(application: QApplication, tmp_path: Path) -> None:
+    folder = make_folder(tmp_path / "takes", ["1-r.bag"])
+    window = app.MainWindow(None)
+    window.settings["auto_load"] = False
+    window.open_folder(folder)
+    window.close()
+    settings = app.load_settings()
+    assert settings["last_folder"] == str(folder.absolute())
+    assert app.start_folder(["app.py"], settings) == folder.absolute()
+    # a folder on the command line comes first; a last folder that is no longer there gives no folder
+    assert app.start_folder(["app.py", "other"], settings) == Path("other")
+    assert app.start_folder(["app.py"], settings | {"last_folder": str(tmp_path / "removed")}) is None
+
+
+def test_an_older_file_of_runs_keeps_the_last_run(tmp_path: Path) -> None:
+    path = tmp_path / "validation_history.json"
+    first, last = {"validated_at": "1", "issues": [], "error": None}, {"validated_at": "2", "issues": [], "error": None}
+    path.write_text(json.dumps({app.LastRuns.key(tmp_path / "1-r.bag"): [first, last]}))
+    runs = app.LastRuns(path)
+    assert runs.get(tmp_path / "1-r.bag") == last
+    runs.set(tmp_path / "1-r.bag", first)
+    assert json.loads(path.read_text()) == {app.LastRuns.key(tmp_path / "1-r.bag"): first}
+
+
+def issue(check: str, frames: list[int]) -> dict:
+    return {"check": check, "stream": "color", "frames": frames, "message": f"color.{check}: text"}
+
+
+def test_the_right_panel_shows_the_last_run(application: QApplication, tmp_path: Path) -> None:
+    folder = make_folder(tmp_path / "takes", ["1-m.bag", "2-m.bag"])
+    window = app.MainWindow(None)
+    window.settings["auto_load"] = False
+    window.open_folder(folder)
+    # the critical duplicate_image (3 copies) comes before the medium issue
+    measures = [{"stream": "color", "name": "image fps", "value": "29.62"}, {"stream": "PC", "name": "total RAM", "value": "15.9 GB"}]
+    run = {"validated_at": "2026-11-16T10:00:00", "fps": [], "measures": measures, "error": None}
+    run["issues"] = [issue("measured_fps", []), issue("duplicate_image", [1, 2, 3])]
+    window.on_validated(str(window.recordings[0]), run, None)
+    assert window.status_label.text() == "critical: 2 issues"
+    assert window.validated_label.text() == "validated 2026-11-16 10:00:00"
+    assert window.tabs.tabText(0) == "Issues (2)"
+    assert [window.issue_table.item(row, 0).text() for row in range(2)] == ["duplicate_image", "measured_fps"]
+    assert [window.measure_table.item(row, 1).text() for row in range(2)] == ["image fps", "total RAM"]
+    # a run of an older version of the app has only the printed lines
+    old_run = {"validated_at": "2026-11-15T10:00:00", "fps": ["color: file fps 33.62, 376 frames in 11.154 s"], "issues": [], "error": None}
+    window.on_validated(str(window.recordings[1]), old_run, None)
+    window.select_path(window.recordings[1])
+    assert window.measure_table.rowCount() == 1
+    assert window.measure_table.item(0, 0).text() == "color: file fps 33.62, 376 frames in 11.154 s"
+    assert window.tabs.tabText(0) == "Issues (0)"
+    window.close()
+
+
+def test_stopped_load_task_sends_no_signal(application: QApplication, tmp_path: Path) -> None:
+    signals = app.WorkerSignals()
+    received = []
+    for signal in [signals.loaded, signals.motion_ready, signals.load_failed, signals.progress]:
+        signal.connect(lambda *values: received.append(values))
+    # a file that is not there: a task that is not stopped sends load_failed
+    task = app.LoadTask(signals, tmp_path / "1-r.bag")
+    task.run()
+    assert len(received) == 1
+    assert task.finished
+    received.clear()
+    stopped_task = app.LoadTask(signals, tmp_path / "1-r.bag")
+    stopped_task.stopped = True
+    stopped_task.run()
+    assert received == []
+    assert stopped_task.finished
+
+
+def test_a_new_selection_stops_the_previous_load(application: QApplication, tmp_path: Path) -> None:
+    folder = make_folder(tmp_path / "takes", ["1-r.bag", "2-r.bag", "3-r.bag"])
+    window = app.MainWindow(None)
+    window.settings["auto_load"] = True
+    window.open_folder(folder)
+    first = window.load_task
+    assert first is not None
+    assert not first.stopped
+    window.select_path(window.recordings[1])
+    second = window.load_task
+    assert first.stopped
+    assert second is not first
+    assert not second.stopped
+    assert not window.load_bar.isHidden()
+    # with the automatic load off, the selection stops the load and starts no new one
+    window.settings["auto_load"] = False
+    window.select_path(window.recordings[2])
+    assert second.stopped
+    assert window.load_task is None
+    assert window.load_bar.isHidden()
+    window.pool.waitForDone()
+    application.processEvents()
     window.close()

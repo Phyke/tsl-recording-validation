@@ -13,6 +13,60 @@ MEASURED_FPS_TOLERANCE = 0.01
 MAX_UNPAIRED_FRAMES = 1
 
 
+# one row of the Measures table of the app: the stream ("color", "depth", or "PC" for the computer of a poc1 take), the name of the
+# measure, and its value as text with its unit; a print_ function of a validator prints its measures and returns them
+def measure(stream: str, name: str, value: str) -> dict[str, str]:
+    return {"stream": stream, "name": name, "value": value}
+
+
+# the image fps: (different images - 1) / duration, where a copy of the previous image (an index in copies) is not a different image;
+# poc1 gives each copy its own barcode, so a file with many copies can have the expected barcode fps and a low image fps;
+# with no copy the image fps is the file fps, which measured_fps checks, so only an image fps below the expected fps is an issue
+def check_image_fps(stream_name: str, frame_count: int, copies: list[int], duration_s: float, fps: int) -> list[ValidationIssue]:
+    if not copies or duration_s <= 0:
+        return []
+    different = frame_count - len(copies)
+    image_fps = (different - 1) / duration_s
+    if image_fps >= fps * (1 - MEASURED_FPS_TOLERANCE):
+        return []
+    message = (
+        f"{stream_name}.image_fps: {image_fps:.2f} ({different} different images in {frame_count} frames), "
+        f"expected {fps} within {MEASURED_FPS_TOLERANCE:.0%}"
+    )
+    return [ValidationIssue(check="image_fps", stream=stream_name, message=message)]
+
+
+# the length of each run of equal images, in the order of the frames: a copy (an index in copies) adds 1 to the run before it
+def image_runs(indices: list[int], copies: list[int]) -> list[int]:
+    copy_indices, runs = set(copies), []
+    for i in indices:
+        if i in copy_indices and runs:
+            runs[-1] += 1
+        else:
+            runs.append(1)
+    return runs
+
+
+# the image fps, the longest run of equal images, and the number of runs of each length (runs of 3 to 5 frames are the pattern of a
+# capture that gives 120 frames per second with about 30 new images); the values have no limit, so they give no issue
+def print_image_runs(stream_name: str, indices: list[int], copies: list[int], duration_s: float) -> list[dict[str, str]]:
+    runs = image_runs(indices, copies)
+    if not runs:
+        return []
+    image_fps = f"{(len(runs) - 1) / duration_s:.2f}" if duration_s > 0 else "not available"
+    counts = "{" + ", ".join(f"{length}: {count}" for length, count in sorted(Counter(runs).items())) + "}"
+    print(
+        f"{stream_name}: image fps {image_fps}, {len(runs)} different images in {len(indices)} frames, longest run {max(runs)} frames, "
+        f"run lengths {counts}"
+    )
+    return [
+        measure(stream_name, "image fps", image_fps),
+        measure(stream_name, "different images", f"{len(runs)} of {len(indices)} frames"),
+        measure(stream_name, "longest run", f"{max(runs)} frames"),
+        measure(stream_name, "run lengths", counts),
+    ]
+
+
 class RecordingValidationError(Exception):
     def __init__(self, issues: list[ValidationIssue]) -> None:
         self.issues = issues
@@ -22,6 +76,8 @@ class RecordingValidationError(Exception):
 class RecordingValidator:
     def __init__(self, recording: Recording) -> None:
         self.recording = recording
+        # the measures of the last validate(), for the Measures table of the app
+        self.measures: list[dict[str, str]] = []
 
     def stream_frames(self, stream_name: str) -> list[tuple[int, StreamFrame]]:
         return [(i, getattr(frame, stream_name)) for i, frame in enumerate(self.recording.frames) if getattr(frame, stream_name) is not None]
@@ -235,26 +291,31 @@ class RecordingValidator:
     # file fps: frames in the file, (frames - 1) / duration
     # camera fps: frames that the camera numbered, (last frame number - first frame number) / duration
     # kept: frames in the file as a percentage of the frames that the camera numbered
-    def print_measured_fps(self, stream_name: str) -> None:
+    def print_measured_fps(self, stream_name: str) -> list[dict[str, str]]:
         frames = self.stream_frames(stream_name)
         if not frames:
-            print(f"{stream_name}: measured fps not available, no {stream_name} stream")
-            return
-        if len(frames) < 2:
-            print(f"{stream_name}: measured fps not available, only 1 frame")
-            return
-        first, last = frames[0][1], frames[-1][1]
-        duration_s = (last.timestamp_ms - first.timestamp_ms) / 1000
-        if duration_s <= 0:
-            print(f"{stream_name}: measured fps not available, duration {duration_s} s")
-            return
+            reason = f"no {stream_name} stream"
+        elif len(frames) < 2:
+            reason = "only 1 frame"
+        else:
+            first, last = frames[0][1], frames[-1][1]
+            duration_s = (last.timestamp_ms - first.timestamp_ms) / 1000
+            reason = f"duration {duration_s} s" if duration_s <= 0 else None
+        if reason is not None:
+            print(f"{stream_name}: measured fps not available, {reason}")
+            return [measure(stream_name, "file fps", f"not available, {reason}")]
         file_fps = (len(frames) - 1) / duration_s
         numbered = last.frame_number - first.frame_number
+        measures = [measure(stream_name, "file fps", f"{file_fps:.2f}")]
         if numbered <= 0:
             print(f"{stream_name}: file fps {file_fps:.2f}, camera fps not available, frame numbers do not increase")
-            return
-        camera_fps = numbered / duration_s
-        kept = (len(frames) - 1) / numbered * 100
-        print(
-            f"{stream_name}: file fps {file_fps:.2f}, camera fps {camera_fps:.2f}, kept {kept:.1f}%, {len(frames)} frames in {duration_s:.3f} s"
-        )
+            measures.append(measure(stream_name, "camera fps", "not available, frame numbers do not increase"))
+        else:
+            camera_fps = numbered / duration_s
+            kept = (len(frames) - 1) / numbered * 100
+            print(
+                f"{stream_name}: file fps {file_fps:.2f}, camera fps {camera_fps:.2f}, kept {kept:.1f}%, {len(frames)} frames in "
+                f"{duration_s:.3f} s"
+            )
+            measures += [measure(stream_name, "camera fps", f"{camera_fps:.2f}"), measure(stream_name, "kept", f"{kept:.1f}%")]
+        return measures + [measure(stream_name, "frames", str(len(frames))), measure(stream_name, "duration", f"{duration_s:.3f} s")]

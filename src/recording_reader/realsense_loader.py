@@ -22,6 +22,11 @@ from .ros2 import Db3, cdr_string
 IMAGE_TOPIC = re.compile(r"^/device_\d+/sensor_\d+/(Depth|Color)_\d+/image/data$")
 
 
+# a load or a motion signal that was stopped because its recording is no longer wanted; it is not an error of the file
+class LoadCancelled(Exception):
+    pass
+
+
 def print_device_info(device: rs.device) -> None:
     for key, info in rs.camera_info.__members__.items():
         if device.supports(info):
@@ -137,11 +142,15 @@ class RealSenseLoader:
         profile.get_device().as_playback().set_real_time(False)
         return pipeline, profile
 
-    def read_frames(self, pipeline: rs.pipeline) -> Iterator[Frame]:
+    # should_stop: asked before each frameset; True stops the read with LoadCancelled
+    def read_frames(self, pipeline: rs.pipeline, should_stop: Callable[[], bool] | None = None) -> Iterator[Frame]:
         # the finally block also stops the pipeline when the caller leaves the loop early
         previous_frame_numbers = {"depth": None, "color": None}
         try:
             while True:
+                if should_stop is not None and should_stop():
+                    raise LoadCancelled(f"{self.path.name}: the load was cancelled")
+
                 # Wait for the next set of frames from the pipeline
                 received, frameset = pipeline.try_wait_for_frames(1000)
 
@@ -193,7 +202,7 @@ class RealSenseLoader:
         pipeline, _ = self.start()
         yield from self.read_frames(pipeline)
 
-    def load(self) -> Recording:
+    def load(self, should_stop: Callable[[], bool] | None = None) -> Recording:
         pipeline, profile = self.start()
         device = profile.get_device()
         playback = device.as_playback()
@@ -207,7 +216,7 @@ class RealSenseLoader:
         serial_number = device.get_info(rs.camera_info.serial_number) if device.supports(rs.camera_info.serial_number) else None
         depth_to_color = self.read_depth_to_color(profile)
         playback.resume()
-        frames = list(self.read_frames(pipeline))
+        frames = list(self.read_frames(pipeline, should_stop))
         # the SDK loads the options in the background after pipeline.start(), so they are read after the frames
         sensor_options = self.read_sensor_options(device)
         return Recording(

@@ -3,3 +3,4 @@ __pycache__/
 settings.json
 validation_history.json
 validation_history.json.part
+pipeline_depth_testing/

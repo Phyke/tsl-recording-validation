@@ -1,9 +1,12 @@
 import itertools
+import os
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
 from mp4_video import Mp4Video
-from recording_reader import CompressedImageMessage, Recording, decode_jpeg
+from recording_reader import CompressedImageMessage, LoadCancelled, Recording, decode_jpeg
 
 SHIFTS = np.arange(-30, 31)
 # the frames are cut to about this width before the difference, so that 640 and 1920 pixel wide frames give a similar scale
@@ -13,6 +16,12 @@ SMALL_WIDTH = 160
 def small_gray(rgb: np.ndarray) -> np.ndarray:
     step = max(1, rgb.shape[1] // SMALL_WIDTH)
     return rgb[::step, ::step].astype(np.float32).mean(axis=2)
+
+
+# should_stop is asked before the work of each frame; True stops the motion signal with LoadCancelled
+def check_stop(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop is not None and should_stop():
+        raise LoadCancelled("the motion signal was cancelled")
 
 
 # the motion signal: the mean absolute change between 2 frames in a row, per second, at the middle time of the 2 frames
@@ -25,11 +34,15 @@ def motion_between(previous: np.ndarray, current: np.ndarray, previous_ms: float
 
 # the D435 motion of color and of depth, one value per frameset from the second on, NaN where a frame of the pair is missing;
 # the depth change counts only the pixels with depth > 0 in both frames, in meters
-def d435_motion(recording: Recording) -> dict:
+def d435_motion(recording: Recording, should_stop: Callable[[], bool] | None = None) -> dict:
     frames = recording.frames
-    grays = [small_gray(frame.color.frame) if frame.color is not None else None for frame in frames]
+    grays = []
+    for frame in frames:
+        check_stop(should_stop)
+        grays.append(small_gray(frame.color.frame) if frame.color is not None else None)
     time_ms, color, depth = (np.full(len(frames) - 1, np.nan) for _ in range(3))
     for t, (previous, current) in enumerate(itertools.pairwise(frames)):
+        check_stop(should_stop)
         if grays[t] is not None and grays[t + 1] is not None:
             time_ms[t], color[t] = motion_between(grays[t], grays[t + 1], previous.color.timestamp_ms, current.color.timestamp_ms)
         if previous.depth is not None and current.depth is not None:
@@ -43,19 +56,30 @@ def d435_motion(recording: Recording) -> dict:
 
 
 # the mirrorless color motion between the frames in the file, in file order; an .mp4 file has times from its own start
-def mirrorless_motion(loaded: Recording | list[CompressedImageMessage] | Mp4Video) -> dict:
+def mirrorless_motion(loaded: Recording | list[CompressedImageMessage] | Mp4Video, should_stop: Callable[[], bool] | None = None) -> dict:
     if isinstance(loaded, Mp4Video):
         times, grays = [], []
         for time_ms, rgb in loaded.iter_frames():
+            check_stop(should_stop)
             times.append(time_ms)
             grays.append(small_gray(rgb))
     elif isinstance(loaded, list):
+
+        def gray_of(message: CompressedImageMessage) -> np.ndarray:
+            check_stop(should_stop)
+            return small_gray(decode_jpeg(message.data))
+
         times = [message.stamp_s * 1000 for message in loaded]
-        grays = [small_gray(decode_jpeg(message.data)) for message in loaded]
+        # the JPEG decode releases the GIL, so one thread per logical core decodes the frames
+        with ThreadPoolExecutor(os.cpu_count()) as pool:
+            grays = list(pool.map(gray_of, loaded))
     else:
         colors = [frame.color for frame in loaded.frames if frame.color is not None]
         times = [color.timestamp_ms for color in colors]
-        grays = [small_gray(color.frame) for color in colors]
+        grays = []
+        for color in colors:
+            check_stop(should_stop)
+            grays.append(small_gray(color.frame))
     pairs = [motion_between(a, b, ta, tb) for (a, ta), (b, tb) in itertools.pairwise(zip(grays, times, strict=True))]
     return {
         "time_ms": np.array([time for time, _ in pairs]),
