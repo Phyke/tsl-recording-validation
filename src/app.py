@@ -13,6 +13,8 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import (
     QElapsedTimer,
     QObject,
+    QPoint,
+    QRect,
     QRunnable,
     Qt,
     QThreadPool,
@@ -26,10 +28,12 @@ from PySide6.QtGui import (
     QKeySequence,
     QMouseEvent,
     QPainter,
+    QPalette,
     QPixmap,
     QResizeEvent,
     QShortcut,
 )
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -63,7 +67,7 @@ from PySide6.QtWidgets import (
 
 from motion_correlation import correlation_from_motion
 from mp4_video import Mp4Video
-from recording_reader import LoadCancelled, decode_jpeg
+from recording_reader import LoadCancelled, decode_jpeg, decode_jpeg_half
 from recordings import (
     BY_LOST_FRAMES,
     DEFAULT_SEVERITY_LEVELS,
@@ -199,6 +203,7 @@ ISSUE_DETAIL_LINES = 3
 # severity_levels: the severity of each known group and each check that is not the default (recordings.DEFAULT_SEVERITY_LEVELS)
 # hidden_issues: the known groups and the checks whose issues the issue list does not show; they still count in the status and the colors
 # details: the full view (the Details box); off: the simple view
+# drawing: the processor that scales the video frames, CPU (ImageView) or GPU (GpuImageView); a change takes effect at the next start
 DEFAULT_SETTINGS = {
     "font_point_size": FONT_POINT_SIZE,
     "auto_load": True,
@@ -206,7 +211,14 @@ DEFAULT_SETTINGS = {
     "severity_levels": {},
     "hidden_issues": [],
     "details": False,
+    "drawing": "CPU",
 }
+DRAWING_MODES = ["CPU", "GPU"]
+DRAWING_ABOUT = (
+    "CPU: the processor scales the video frames. GPU: the graphics card scales the frames with OpenGL. In both modes the CPU decodes "
+    "the frames. Use CPU on a PC with no OpenGL driver, because there the GPU mode uses a slow software OpenGL. "
+    "The change takes effect at the next start of the app."
+)
 
 
 def load_settings() -> dict[str, Any]:
@@ -355,11 +367,13 @@ class Frames:
         colors[0] = 0
         return colors
 
-    def color(self, i: int) -> np.ndarray | None:
+    # playing: a JPEG frame decodes at half size, because a full decode takes longer than the frame period of a 120 fps take; a
+    # paused frame has the full size
+    def color(self, i: int, playing: bool = False) -> np.ndarray | None:
         if isinstance(self.loaded, Mp4Video):
             return self.loaded.frame(i)
         if isinstance(self.loaded, list):
-            return decode_jpeg(self.loaded[i].data)
+            return decode_jpeg_half(self.loaded[i].data) if playing else decode_jpeg(self.loaded[i].data)
         color = self.loaded.frames[i].color
         if color is None:
             return None
@@ -386,7 +400,6 @@ class Frames:
 
 class WorkerSignals(QObject):
     loaded = Signal(str, object)
-    motion_ready = Signal(str, object)
     load_failed = Signal(str, str)
     validated = Signal(str, object, object)
     correlated = Signal(object, object)
@@ -402,9 +415,10 @@ def reuse_or_load(path: Path, player_frames: Frames | None) -> Loaded:
     return load_recording(path)
 
 
-# the player gets the frames first; the motion signal for the cross-correlation comes after (not for .mp4: it needs a full decode)
-# stopped: the recording is no longer selected; a task in the queue then does nothing, and a task that runs stops its load or its
-# motion signal and sends no signal
+# the load of the player; the motion signal for the cross-correlation comes only at a Cross-correlation click (CorrelateTask), so that
+# it does not slow the playback after a load
+# stopped: the recording is no longer selected; a task in the queue then does nothing, and a task that runs stops its load and sends
+# no signal
 class LoadTask(QRunnable):
     def __init__(self, signals: WorkerSignals, path: Path) -> None:
         super().__init__()
@@ -429,14 +443,6 @@ class LoadTask(QRunnable):
             self.signals.load_failed.emit(str(self.path), traceback.format_exc())
             return
         self.signals.loaded.emit(str(self.path), loaded)
-        if self.stopped or isinstance(loaded, Mp4Video):
-            return
-        try:
-            self.signals.motion_ready.emit(str(self.path), motion_of(self.path, loaded, lambda: self.stopped))
-        except LoadCancelled:
-            return
-        except READ_ERRORS:
-            self.signals.progress.emit(f"motion signal failed: {traceback.format_exc().strip().splitlines()[-1]}")
 
 
 # one recording at a time, so that only one recording is in memory; the recording in the player is not loaded again
@@ -532,6 +538,63 @@ class ImageView(QLabel):
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self.render_image()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        self.clicked.emit()
+
+
+# the ImageView of the GPU drawing mode (Settings): it draws with OpenGL; during the playback the GPU scales the frame, and a paused
+# frame has the smooth scale of the CPU, as in ImageView
+class GpuImageView(QOpenGLWidget):
+    clicked = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.setMinimumSize(1, 1)
+        self.image: QImage | None = None
+        self.text = ""
+        self.missing_text = ""
+        self.fast = False
+
+    def show_array(self, rgb: np.ndarray | None, missing_text: str) -> None:
+        if rgb is None:
+            self.missing_text = missing_text
+        else:
+            self.missing_text = ""
+            rgb = np.ascontiguousarray(rgb)
+            height, width, _ = rgb.shape
+            self.image = QImage(rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888).copy()
+        self.update()
+
+    def clear_image(self, text: str) -> None:
+        self.image, self.missing_text, self.text = None, "", text
+        self.update()
+
+    def paintGL(self) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Window))
+        painter.setPen(self.palette().color(QPalette.ColorRole.WindowText))
+        if self.image is None:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.missing_text or self.text)
+            painter.end()
+            return
+        target = QRect(QPoint(0, 0), self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio))
+        target.moveCenter(self.rect().center())
+        if self.fast:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawImage(target, self.image)
+        else:
+            smooth = self.image.scaled(target.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            painter.drawImage(target, smooth)
+        if self.missing_text:
+            painter.fillRect(target, QColor(0, 0, 0, 150))
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor("#ff6b6b"))
+            painter.drawText(target, Qt.AlignmentFlag.AlignCenter, f"{self.missing_text}\n(the previous image is shown)")
+        painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self.clicked.emit()
@@ -646,12 +709,17 @@ class SettingsDialog(QDialog):
         self.auto_load_box = QCheckBox("Load the video when a recording is selected")
         self.auto_load_box.setToolTip("When this is off, click the player to load the video.")
         self.auto_load_box.setChecked(window.settings["auto_load"])
+        self.drawing_box = QComboBox()
+        self.drawing_box.addItems(DRAWING_MODES)
+        self.drawing_box.setCurrentText(window.settings["drawing"])
+        self.drawing_box.setToolTip(DRAWING_ABOUT)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QFormLayout(self)
         layout.addRow("Font size", self.size_box)
         layout.addRow(self.auto_load_box)
+        layout.addRow("Draw frames with", self.drawing_box)
         layout.addRow(self.checks_box(set(window.settings["hidden_issues"])))
         layout.addRow(buttons)
 
@@ -745,7 +813,6 @@ class MainWindow(QMainWindow):
         self.pool.setMaxThreadCount(1)
         self.signals = WorkerSignals()
         self.signals.loaded.connect(self.on_loaded)
-        self.signals.motion_ready.connect(self.on_motion_ready)
         self.signals.load_failed.connect(self.on_load_failed)
         self.signals.validated.connect(self.on_validated)
         self.signals.correlated.connect(self.on_correlated)
@@ -855,7 +922,8 @@ class MainWindow(QMainWindow):
         middle = QWidget()
         layout = QVBoxLayout(middle)
         views = QHBoxLayout()
-        self.color_view, self.depth_view = ImageView(), ImageView()
+        view_class = GpuImageView if self.settings["drawing"] == "GPU" else ImageView
+        self.color_view, self.depth_view = view_class(), view_class()
         self.color_view.clicked.connect(self.load_clicked)
         self.depth_view.clicked.connect(self.load_clicked)
         self.depth_column = QWidget()
@@ -972,7 +1040,11 @@ class MainWindow(QMainWindow):
             "severity_levels": dialog.changed_levels(),
             "hidden_issues": dialog.hidden_issues(),
         }
+        drawing_before = self.settings["drawing"]
+        self.settings["drawing"] = dialog.drawing_box.currentText()
         save_settings(self.settings)
+        if self.settings["drawing"] != drawing_before:
+            self.statusBar().showMessage(f"the frames are drawn with the {self.settings['drawing']} at the next start of the app")
         # the colors of the recording list and the result panel come from the levels
         set_severity_levels(self.settings["severity_levels"])
         for path in self.recording_items:
@@ -1158,9 +1230,6 @@ class MainWindow(QMainWindow):
         self.show_frame(0)
         self.statusBar().showMessage(f"{path.name}: {self.frames.count} frames")
 
-    def on_motion_ready(self, path_text: str, motion: dict) -> None:
-        self.motions[Path(path_text)] = motion
-
     def on_load_failed(self, path_text: str, trace: str) -> None:
         if Path(path_text) == self.requested:
             self.load_bar.hide()
@@ -1174,7 +1243,7 @@ class MainWindow(QMainWindow):
             return
         self.index = min(max(i, 0), self.frames.count - 1)
         try:
-            color = self.frames.color(self.index)
+            color = self.frames.color(self.index, self.playing)
         except ValueError as error:
             self.info_label.setText(str(error))
             return
@@ -1461,7 +1530,7 @@ class MainWindow(QMainWindow):
         self.issue_position = (self.issue_position + delta) % len(self.issue_frames)
         self.go_to_issue_frame()
 
-    # with the motion signals in memory (from a load or a validation) the curves need no file read
+    # with the motion signals in memory (from a validation or an earlier Cross-correlation) the curves need no file read
     def correlate_selected(self) -> None:
         # a click on the small plot while a task runs does not start a second task
         if self.requested is None or not self.correlate_button.isEnabled():

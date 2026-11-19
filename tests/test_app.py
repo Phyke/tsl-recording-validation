@@ -215,7 +215,7 @@ def test_the_right_panel_shows_the_last_run(application: QApplication, tmp_path:
 def test_stopped_load_task_sends_no_signal(application: QApplication, tmp_path: Path) -> None:
     signals = app.WorkerSignals()
     received = []
-    for signal in [signals.loaded, signals.motion_ready, signals.load_failed, signals.progress]:
+    for signal in [signals.loaded, signals.load_failed, signals.progress]:
         signal.connect(lambda *values: received.append(values))
     # a file that is not there: a task that is not stopped sends load_failed
     task = app.LoadTask(signals, tmp_path / "1-r.bag")

@@ -19,6 +19,13 @@ def decode_jpeg(data: bytes) -> np.ndarray:
     return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
 
 
+# the JPEG at half its width and height, for the playback: the decoder reads the JPEG at 1/2 scale, which is faster than a full decode
+def decode_jpeg_half(data: bytes) -> np.ndarray:
+    image = Image.open(io.BytesIO(data))
+    image.draft("RGB", (image.width // 2, image.height // 2))
+    return np.asarray(image.convert("RGB"))
+
+
 # a .db3 folder from poc1 UvcRos2Bag: JPEG frames of the mirrorless camera through the Elgato
 class MirrorlessRos2Loader(Db3):
     TOPIC = "/camera/color/image_raw/compressed"

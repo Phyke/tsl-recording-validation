@@ -13,6 +13,7 @@ from .mirrorless.barcode import (
 from .mirrorless.ros2_loader import (
     MirrorlessRos2Loader,
     decode_jpeg,
+    decode_jpeg_half,
     parse_compressed_image,
 )
 from .mirrorless.validator import MirrorlessRos2Validator, MirrorlessRosValidator
@@ -68,6 +69,7 @@ __all__ = [
     "ValidationIssue",
     "cdr_string",
     "decode_jpeg",
+    "decode_jpeg_half",
     "decompress",
     "key_values",
     "measure",
