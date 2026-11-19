@@ -9,7 +9,7 @@ from recording_reader import (
     MirrorlessRosValidator,
     RealSenseLoader,
 )
-from recordings import camera_of, pair_issues
+from recordings import camera_of, pair_issues, requested_fps
 
 parser = argparse.ArgumentParser(description="Validate one recording file")
 parser.add_argument("path", type=Path, help="a -r (RealSense D435) or -m (mirrorless) recording, .bag or .db3")
@@ -27,7 +27,8 @@ if camera == "d435":
 elif path.suffix == ".bag":
     issues = MirrorlessRosValidator(RealSenseLoader(path, forward_fill=False).load()).validate(raise_error=False)
 else:
-    issues = MirrorlessRos2Validator(MirrorlessRos2Loader(path).load()).validate(raise_error=False)
+    # checked at the requested fps of the poc1 report of the take, 120 with no report
+    issues = MirrorlessRos2Validator(MirrorlessRos2Loader(path).load(), requested_fps(path)).validate(raise_error=False)
 issues += pair_issues(path)
 print(f"{path}: {len(issues)} {'issue' if len(issues) == 1 else 'issues'}")
 for issue in issues:

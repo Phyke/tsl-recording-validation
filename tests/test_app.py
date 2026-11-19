@@ -36,6 +36,9 @@ def test_run_summary_counts_one_issue_and_more() -> None:
     assert app.run_summary({"error": None, "issues": []}) == "OK"
     assert app.run_summary({"error": None, "issues": [issue]}) == "medium: 1 issue"
     assert app.run_summary({"error": None, "issues": [issue, issue]}) == "medium: 2 issues"
+    message = "notification: Left MIPI error (hardware_error, error, Stereo Module), 1 time"
+    low = {"check": "notification", "stream": None, "frames": [], "message": message}
+    assert app.run_summary({"error": None, "issues": [low]}) == "low: 1 issue"
 
 
 @pytest.mark.parametrize(
@@ -103,6 +106,30 @@ def test_the_list_has_one_item_for_each_take_with_its_files(application: QApplic
     window.close()
 
 
+# a file that is added to or removed from the open folder changes the list at the next scan; the open take and the selected file stay,
+# and the selected file does not load again
+def test_the_list_finds_new_and_removed_files(application: QApplication, tmp_path: Path) -> None:
+    folder = make_folder(tmp_path / "takes", ["1-m.bag", "1-r.bag", "2-r.bag"])
+    window = app.MainWindow(None)
+    window.settings["auto_load"] = False
+    window.open_folder(folder)
+    assert window.rescan_timer.isActive()
+    window.select_path(folder / "1-r.bag")
+    selections = []
+    window.select_recording = selections.append
+    (folder / "3-r.bag").touch()
+    (folder / "2-r.bag").unlink()
+    window.rescan_folder()
+    assert window.recordings == [folder / "1-m.bag", folder / "1-r.bag", folder / "3-r.bag"]
+    takes = [window.recording_list.topLevelItem(i) for i in range(window.recording_list.topLevelItemCount())]
+    assert [take.text(0) for take in takes] == ["1", "3"]
+    assert takes[0].isExpanded()
+    assert not takes[1].isExpanded()
+    assert window.recording_list.currentItem() is window.recording_items[folder / "1-r.bag"]
+    assert selections == []
+    window.close()
+
+
 def test_the_last_folder_opens_at_the_next_start(application: QApplication, tmp_path: Path) -> None:
     folder = make_folder(tmp_path / "takes", ["1-r.bag"])
     window = app.MainWindow(None)
@@ -131,20 +158,49 @@ def issue(check: str, frames: list[int]) -> dict:
     return {"check": check, "stream": "color", "frames": frames, "message": f"color.{check}: text"}
 
 
+def test_the_full_view_puts_the_issues_under_their_known_group(application: QApplication, tmp_path: Path) -> None:
+    folder = make_folder(tmp_path / "takes", ["1-r.bag"])
+    window = app.MainWindow(None)
+    window.settings["auto_load"] = False
+    window.details_box.setChecked(True)
+    window.open_folder(folder)
+    message = "notification: Left MIPI error (hardware_error, error, Stereo Module), 1 time"
+    notification = {"check": "notification", "stream": None, "frames": [], "message": message}
+    run = {"validated_at": "2026-11-18T10:00:00", "fps": [], "measures": [], "error": None}
+    run["issues"] = [notification, issue("measured_fps", [])]
+    window.on_validated(str(window.recordings[0]), run, None)
+    assert window.status_label.text() == "medium: 2 issues"
+    # the group with the worst issue first
+    groups = [window.issue_tree.topLevelItem(row) for row in range(window.issue_tree.topLevelItemCount())]
+    assert [group.text(0) for group in groups] == ["No group  [medium: 1 issue]", "Hardware Instability  [low: 1 issue]"]
+    assert [group.child(0).text(0) for group in groups] == ["measured_fps", "notification"]
+    assert groups[1].child(0).toolTip(0).startswith("low, Hardware Instability: notification: Left MIPI error")
+    window.close()
+
+
 def test_the_right_panel_shows_the_last_run(application: QApplication, tmp_path: Path) -> None:
     folder = make_folder(tmp_path / "takes", ["1-m.bag", "2-m.bag"])
     window = app.MainWindow(None)
     window.settings["auto_load"] = False
     window.open_folder(folder)
-    # the critical duplicate_image (3 copies) comes before the medium issue
+    # the simple view is the default; the critical duplicate_image (copies in 3 of 10 frames) comes before the medium issue
     measures = [{"stream": "color", "name": "image fps", "value": "29.62"}, {"stream": "PC", "name": "total RAM", "value": "15.9 GB"}]
     run = {"validated_at": "2026-11-16T10:00:00", "fps": [], "measures": measures, "error": None}
-    run["issues"] = [issue("measured_fps", []), issue("duplicate_image", [1, 2, 3])]
+    message = "color.frame: the same image as the previous frame in 3 of 10 frames: [1, 2, 3]"
+    copies = {**issue("duplicate_image", [1, 2, 3]), "message": message}
+    run["issues"] = [issue("timestamp_order", [4]), copies]
     window.on_validated(str(window.recordings[0]), run, None)
-    assert window.status_label.text() == "critical: 2 issues"
+    assert window.status_label.text() == "Problem"
     assert window.validated_label.text() == "validated 2026-11-16 10:00:00"
     assert window.tabs.tabText(0) == "Issues (2)"
-    assert [window.issue_table.item(row, 0).text() for row in range(2)] == ["duplicate_image", "measured_fps"]
+    rows = [window.issue_tree.topLevelItem(row) for row in range(window.issue_tree.topLevelItemCount())]
+    assert [row.text(0) for row in rows] == ["Problem (1)", "Check (1)"]
+    # the Frames column gives the number of frames, or the frame index of a single frame
+    assert [(row.child(0).text(0), row.child(0).text(2)) for row in rows] == [
+        (f"{app.PLAIN_TEXTS['duplicate_image']} (color)", "3 frames"),
+        (f"{app.PLAIN_TEXTS['timestamp_order']} (color)", "frame 4"),
+    ]
+    assert window.issue_frame_label.text() == "frame 1 (issue frame 1 of 3)"
     assert [window.measure_table.item(row, 1).text() for row in range(2)] == ["image fps", "total RAM"]
     # a run of an older version of the app has only the printed lines
     old_run = {"validated_at": "2026-11-15T10:00:00", "fps": ["color: file fps 33.62, 376 frames in 11.154 s"], "issues": [], "error": None}

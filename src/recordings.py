@@ -7,7 +7,7 @@ import sqlite3
 import statistics
 import struct
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from compression import zstd
 from datetime import datetime
 from pathlib import Path
@@ -39,14 +39,56 @@ type Loaded = Recording | list[CompressedImageMessage] | Mp4Video
 # sqlite3, struct, or zstd errors, and the readers raise ValueError and IndexError
 READ_ERRORS = (OSError, RuntimeError, ValueError, IndexError, av.FFmpegError, sqlite3.Error, struct.error, zstd.ZstdError)
 
-# severity: a wrong camera setting or a stream that is not there is critical; the checks that lose frames are medium for 1 or 2
-# lost frames in the file (all the gaps of the check added) and critical for more, but a frame_number_gaps gap at a missing_frame
-# frameset takes the severity of the missing_frame (frame_number_gap_severity); a duplicate_image frame is a lost image, so it follows
-# the same count rule; every other check is medium, which includes notification, timestamp_domain, measured_fps, image_fps,
-# frames_not_loaded, missing_partner, pair_duration, report_no_frame_drops, and dropped_capture_frames
-CRITICAL_CHECKS = {"missing_stream", "fps", "size", "format", "serial_number", "unexpected_stream"}
+# Hardware Instability: a known group of issues, the D435 notifications at a stream start; the depth data after each one was at the
+# level of a take with no notification (recording_survey.md, the D435 notification issue)
+HARDWARE_INSTABILITY = {"Left MIPI error", "Right MIPI error", "Depth stream start failure"}
+# Half image rate: a known group of issues, the checks of a file whose color copies come in pairs (each image in 2 frames); in the
+# stored runs, the files with this pattern had 93.3% to 100% steps of 2 frames between 2 copies, and the other files 0% to 33.6%
+HALF_IMAGE_RATE_CHECKS = {"duplicate_image", "image_fps", "report_no_frame_drops"}
+MIN_PAIR_STEPS = 0.9
+# the text of each known group for the app
+GROUP_ABOUT = {
+    "Hardware Instability": (
+        f"The D435 notifications {', '.join(sorted(HARDWARE_INSTABILITY))} at a stream start. The depth data after each one was at the "
+        "level of a take with no notification. This level wins over notification."
+    ),
+    "Half image rate": (
+        f"The issues {', '.join(sorted(HALF_IMAGE_RATE_CHECKS))} of a file whose color copies come in pairs: at least "
+        f"{MIN_PAIR_STEPS:.0%} of the steps between 2 copies are 2 frames. So about half of the frames are different images. "
+        "Possible causes, not confirmed: a slow CPU, or the capture card downsampling the input (for example, a 60 Hz monitor on its "
+        "HDMI OUT port). This level wins over the levels of these checks."
+    ),
+}
+# the severity levels, the worst first
+LEVELS = ["critical", "medium", "low"]
+# the count rule of the checks that lose frames: medium for 1 or 2 lost frames in the file (all the gaps of the check added) and
+# critical for more; a frame_number_gaps gap at a missing_frame frameset takes the severity of the missing_frame
+# (frame_number_gap_severity); for duplicate_image the rule is a share: medium for copies in up to 5% of the frames, critical for more
+BY_LOST_FRAMES = "by lost frames"
+# the default severity of each known group and each check: a wrong camera setting or a stream that is not there is critical; the
+# Hardware Instability group is low and the Half image rate group is critical, and a group level wins over the level of its checks;
+# every other check is medium; the app settings can change each value (set_severity_levels)
+DEFAULT_SEVERITY_LEVELS = {
+    "Hardware Instability": "low",
+    "Half image rate": "critical",
+    **dict.fromkeys(["missing_stream", "fps", "size", "format", "serial_number", "unexpected_stream"], "critical"),
+    **dict.fromkeys(["missing_frame", "duplicate_image", "frame_number_gaps", "barcode_gaps", "timestamp_gaps"], BY_LOST_FRAMES),
+    **dict.fromkeys(
+        [
+            "color_depth_offset", "constant_value", "decreasing_barcode", "decreasing_frame_number", "depth_to_color",
+            "dropped_capture_frames", "duplicate_barcode", "duplicate_frame_number", "frames_not_loaded", "image_fps", "measured_fps",
+            "metadata_keys", "missing_barcode", "missing_partner", "notification", "pair_duration", "report", "report_no_frame_drops",
+            "timestamp_domain", "timestamp_order",
+        ],
+        "medium",
+    ),
+}
+severity_levels = dict(DEFAULT_SEVERITY_LEVELS)
 GAP_CHECKS = {"frame_number_gaps", "barcode_gaps", "timestamp_gaps"}
 MAX_MEDIUM_LOST_FRAMES = 2
+MAX_MEDIUM_COPY_SHARE = 0.05
+# "the same image as the previous frame in 30 of 1000 frames" (duplicate_image)
+COPY_SHARE = re.compile(r"in (\d+) of (\d+) frames")
 # "4 frame numbers missing" (frame_number_gaps, barcode_gaps) or "about 867 frames missing" (timestamp_gaps)
 LOST_FRAMES = re.compile(r"(\d+) frame numbers missing|about (\d+) frames missing")
 # one range per gap after "missing: " in a frame_number_gaps message: "[90430, 90434]" or "77"
@@ -202,6 +244,15 @@ def meta_path(path: Path, suffix: str) -> Path:
     return take_key(path)[0] / "meta" / f"{path.stem.removesuffix('_color')}{suffix}"
 
 
+# the requested_fps of the poc1 report of the take, or None when there is no report or no value
+def requested_fps(path: Path) -> int | None:
+    try:
+        value = json.loads(meta_path(path, ".report.json").read_text()).get("requested_fps")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, int) and value > 0 else None
+
+
 # the checks of the poc1 report against the file: copies is the number of duplicate_image frames, None for an .mp4 file (its
 # check has no copy count); dropped_capture_frames is in the reports of the recorder that counts the ffmpeg drop warnings
 def report_issues(path: Path, copies: int | None) -> list[ValidationIssue]:
@@ -272,6 +323,13 @@ def count_severity(count: int) -> str:
     return "critical" if count > MAX_MEDIUM_LOST_FRAMES else "medium"
 
 
+def copy_severity(issue: dict[str, Any]) -> str:
+    match = COPY_SHARE.search(issue["message"])
+    if match is None:
+        raise ValueError(f"duplicate_image: no count of frames in the message: {issue['message']}")
+    return "critical" if int(match[1]) / int(match[2]) > MAX_MEDIUM_COPY_SHARE else "medium"
+
+
 # a gap that ends at a missing_frame frameset (or right after one) is the same event as the missing_frame, so it takes the
 # severity of the missing_frame; the other gaps of the check are added and follow the count rule
 def frame_number_gap_severity(issue: dict[str, Any], issues: list[dict[str, Any]]) -> str:
@@ -282,20 +340,53 @@ def frame_number_gap_severity(issue: dict[str, Any], issues: list[dict[str, Any]
         if event is None:
             other_lost += size
             continue
-        severities.add(count_severity(len(event["frames"])))
+        severities.add(issue_severity(event, issues))
     if other_lost:
         severities.add(count_severity(other_lost))
-    return "critical" if "critical" in severities else "medium"
+    return min(severities, key=LEVELS.index)
 
 
-# issues: all the issues of the run, because a frame_number_gaps issue depends on the missing_frame issues
+# True when the color copies of the run come in pairs: at least MIN_PAIR_STEPS of the steps between 2 copies are 2 frames
+def copies_in_pairs(issues: Sequence[dict[str, Any]]) -> bool:
+    copies = next((issue["frames"] for issue in issues if issue["check"] == "duplicate_image" and issue["stream"] == "color"), [])
+    steps = [b - a for a, b in zip(copies, copies[1:])]
+    return bool(steps) and sum(1 for step in steps if step == 2) / len(steps) >= MIN_PAIR_STEPS
+
+
+# the known group of an issue, or None; issues: all the issues of the run, because the Half image rate group depends on the
+# duplicate_image issue; the message of a notification is
+# "notification: Left MIPI error (hardware_error, error, Stereo Module), 1 time. What to do: ..."
+def issue_group(issue: dict[str, Any], issues: Sequence[dict[str, Any]] = ()) -> str | None:
+    description = issue["message"].removeprefix("notification: ").split(" (", 1)[0]
+    if issue["check"] == "notification" and description in HARDWARE_INSTABILITY:
+        return "Hardware Instability"
+    if issue["check"] in HALF_IMAGE_RATE_CHECKS and copies_in_pairs(issues):
+        return "Half image rate"
+    return None
+
+
+# the severity levels of the app settings, on top of the defaults; a key or a level that the app does not know is not used
+def set_severity_levels(levels: dict[str, str]) -> None:
+    known = {
+        key: level for key, level in levels.items()
+        if key in DEFAULT_SEVERITY_LEVELS and (level in LEVELS or level == BY_LOST_FRAMES == DEFAULT_SEVERITY_LEVELS[key])
+    }
+    severity_levels.clear()
+    severity_levels.update(DEFAULT_SEVERITY_LEVELS | known)
+
+
+# issues: all the issues of the run, because a frame_number_gaps issue depends on the missing_frame issues; the level of a known group
+# wins over the level of the check; a check that the app does not know (in an older run) is medium
 def issue_severity(issue: dict[str, Any], issues: list[dict[str, Any]]) -> str:
-    if issue["check"] in CRITICAL_CHECKS:
-        return "critical"
+    group = issue_group(issue, issues)
+    level = severity_levels[group] if group else severity_levels.get(issue["check"], "medium")
+    if level != BY_LOST_FRAMES:
+        return level
     if issue["check"] == "frame_number_gaps":
         return frame_number_gap_severity(issue, issues)
-    count = lost_frames(issue)
-    return "medium" if count is None else count_severity(count)
+    if issue["check"] == "duplicate_image":
+        return copy_severity(issue)
+    return count_severity(lost_frames(issue))
 
 
 # a file that cannot be read is critical
@@ -305,7 +396,9 @@ def run_severity(run: dict[str, Any]) -> str:
     severities = {issue_severity(issue, run["issues"]) for issue in run["issues"]}
     if "critical" in severities:
         return "critical"
-    return "medium" if severities else "OK"
+    if "medium" in severities:
+        return "medium"
+    return "low" if severities else "OK"
 
 
 # should_stop: True stops the read of a RealSense file with LoadCancelled; the 2 other loads are short and do not ask
@@ -319,12 +412,14 @@ def load_recording(path: Path, should_stop: Callable[[], bool] | None = None) ->
 
 # the validators print the measured fps and return the measures; the printed lines ("fps") and the measures are kept with the issues
 def validate_recording(path: Path, loaded: Loaded) -> dict[str, Any]:
+    # a mirrorless take is checked at the fps that poc1 requested (120 or 60); with no report, the validators use 120
+    fps = requested_fps(path) if camera_of(path) == "mirrorless" else None
     if isinstance(loaded, Mp4Video):
-        fps_lines, issues, measures = validate_mp4(loaded, camera_of(path))
+        fps_lines, issues, measures = validate_mp4(loaded, camera_of(path), fps)
         issues += pair_issues(path, loaded) + report_issues(path, copies=None)
     else:
         if isinstance(loaded, list):
-            validator = MirrorlessRos2Validator(loaded)
+            validator = MirrorlessRos2Validator(loaded, fps)
         elif camera_of(path) == "d435":
             validator = D435Validator(loaded)
         else:

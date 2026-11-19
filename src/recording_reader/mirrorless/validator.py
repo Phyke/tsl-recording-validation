@@ -53,13 +53,18 @@ def frame_value(message: CompressedImageMessage) -> dict[str, Any]:
     return {"format": image.format, "size": image.size, "barcode": read_barcode(rgb), "image_digest": digest}
 
 
-# -m ROS2 (.db3) files from poc1 UvcRos2Bag: JPEG frames of the mirrorless camera, 1920x1080 at 120 fps,
-# with the frame number as a barcode along the top edge of each frame
+# the fps of the mirrorless camera when the poc1 report gives no requested fps
+MIRRORLESS_FPS = 120
+
+
+# -m ROS2 (.db3) files from poc1 UvcRos2Bag: JPEG frames of the mirrorless camera, 1920x1080 at the fps that poc1 requested (fps,
+# from the report of the take; MIRRORLESS_FPS when it is None), with the frame number as a barcode along the top edge of each frame
 class MirrorlessRos2Validator:
-    def __init__(self, frames: list[CompressedImageMessage]) -> None:
+    def __init__(self, frames: list[CompressedImageMessage], fps: int | None = None) -> None:
         if not frames:
             raise ValueError("no frames")
         self.frames = frames
+        self.fps = fps or MIRRORLESS_FPS
         # the measures of the last validate(), for the Measures table of the app
         self.measures: list[dict[str, str]] = []
 
@@ -182,12 +187,12 @@ class MirrorlessRos2Validator:
         issues += self.check_size(values, width=1920, height=1080)
         issues += self.check_barcodes(values)
         issues += self.check_timestamps()
-        issues += self.check_measured_fps(values, fps=120)
+        issues += self.check_measured_fps(values, fps=self.fps)
         duplicate_issues = self.check_duplicate_images(values)
         issues += duplicate_issues
         copies = duplicate_issues[0].frames if duplicate_issues else []
         duration_s = self.frames[-1].stamp_s - self.frames[0].stamp_s
-        issues += check_image_fps("color", len(values), copies, duration_s, fps=120)
+        issues += check_image_fps("color", len(values), copies, duration_s, fps=self.fps)
         self.measures = self.print_measured_fps(values) + print_image_runs("color", list(range(len(values))), copies, duration_s)
         if issues and raise_error:
             raise RecordingValidationError(issues)

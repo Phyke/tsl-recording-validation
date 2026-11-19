@@ -6,7 +6,7 @@ from .depth_quality import fill_rates, flat_surface, surface_noise
 from .notifications import D400_FW_ERROR_REPORT, D400_WHAT_TO_DO
 
 # the serial numbers of the D435 cameras of the project; a recording from a different camera gets a serial_number issue
-KNOWN_SERIAL_NUMBERS = {"317622070655", "239722070026"}
+KNOWN_SERIAL_NUMBERS = {"317622070655", "239722070026", "241222074175"}
 # global_time: the capture time from the camera clock, converted to the clock of the computer; system_time shows that the
 # computer got no hardware timestamps from the camera, so the time is the arrival time of the frame
 TIMESTAMP_DOMAIN = "global_time"

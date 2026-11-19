@@ -59,9 +59,11 @@ class Mp4Video:
 
 
 # the checks of an .mp4 file of the camera ("d435" or "mirrorless"): size, declared fps, frames with the same time, and gaps longer
-# than 1.5 frame periods; returns the measured fps lines, the issues, and the measures
-def validate_mp4(video: Mp4Video, camera: str) -> tuple[list[str], list[ValidationIssue], list[dict[str, str]]]:
+# than 1.5 frame periods; fps: the fps that poc1 requested, from the report of the take (EXPECTED when it is None); returns the
+# measured fps lines, the issues, and the measures
+def validate_mp4(video: Mp4Video, camera: str, fps: int | None = None) -> tuple[list[str], list[ValidationIssue], list[dict[str, str]]]:
     expected_width, expected_height, expected_fps = EXPECTED[camera]
+    expected_fps = fps or expected_fps
     issues = []
     if (video.width, video.height) != (expected_width, expected_height):
         message = f"color.size: {video.width}x{video.height}, expected {expected_width}x{expected_height}"

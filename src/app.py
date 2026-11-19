@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -64,6 +65,10 @@ from motion_correlation import correlation_from_motion
 from mp4_video import Mp4Video
 from recording_reader import LoadCancelled, decode_jpeg
 from recordings import (
+    BY_LOST_FRAMES,
+    DEFAULT_SEVERITY_LEVELS,
+    GROUP_ABOUT,
+    LEVELS,
     READ_ERRORS,
     Loaded,
     camera_or_none,
@@ -71,10 +76,13 @@ from recordings import (
     file_label,
     find_recordings,
     group_takes,
+    issue_group,
     issue_severity,
     load_recording,
     motion_of,
     run_severity,
+    set_severity_levels,
+    severity_levels,
     validate_file,
     validation_run,
 )
@@ -102,7 +110,7 @@ MEASURE_ABOUT = {
     "image fps": "Different images per second: (different images - 1) / duration. A copy of the previous image is not a different image.",
     "different images": "The number of frames with an image that is different from the previous frame.",
     "longest run": "The largest number of frames in a row with the same image.",
-    "run lengths": "{length: count}: the number of runs of each length of frames with the same image. "
+    "run lengths": "The number of runs of each length of frames with the same image. "
                    "Runs of 3 to 5 frames are the pattern of a capture that gives 120 frames per second with about 30 new images.",
     "fill rate": "The part of the depth pixels that has a depth value: the mean of all the frames.",
     "lowest fill rate": "The fill rate of the frame with the lowest fill rate.",
@@ -112,20 +120,71 @@ MEASURE_ABOUT = {
     "CPU median": "The median CPU load of the PC during the poc1 take, from meta/<take>_sysmon.csv. The first row is not in the median.",
     "total RAM": "The total RAM of the PC, from meta/<take>_sysmon.csv.",
 }
+# one "length: count" pair of the run lengths measure
+RUN_LENGTH_PAIR = re.compile(r"(\d+): (\d+)")
 ISSUE_COLUMNS = [
-    ("Check", "The name of the validation check that found the issue."),
+    ("Check", "The name of the validation check that found the issue. The issues are under their known group. The issues of a "
+              "known group have a known cause. Click a group row to open or close it."),
     ("Stream", "The camera stream that has the issue."),
     ("Frames", "The frame of the issue, or the number of frames with the issue. Select the row to go to these frames."),
     ("Message", "What the check found. Put the pointer on a row to see the full text, or select the row to see it in the box below."),
 ]
 HISTORY_PATH = Path(__file__).resolve().parent.parent / "validation_history.json"
 SETTINGS_PATH = Path(__file__).resolve().parent.parent / "settings.json"
-STATUS_COLORS = {"OK": "#1a7f37", "medium": "#d97706", "critical": "#cf222e"}
+STATUS_COLORS = {"OK": "#1a7f37", "low": "#0969da", "medium": "#d97706", "critical": "#cf222e"}
 # the item data of the recording list: the path of a file item (None for a take item), and the label of a take item
 PATH_ROLE = Qt.ItemDataRole.UserRole
 TAKE_LABEL_ROLE = Qt.ItemDataRole.UserRole + 1
+# the item data of the issue list: the issue of an issue item (None for a group item)
+ISSUE_ROLE = Qt.ItemDataRole.UserRole
+# the group item of the issues that are in no known group
+NO_GROUP = "No group"
+# the simple view (the Details box is off) is for the people who record: one verdict for each severity, and a plain text for each
+# known group and each check
+VERDICTS = {"critical": "Problem", "medium": "Check", "low": "Good", "OK": "Good"}
+VERDICT_COLORS = {"Problem": "#cf222e", "Check": "#d97706", "Good": "#1a7f37"}
+# the simple view puts the low issues in this closed row
+OTHER_NOTES = "Other notes"
+PLAIN_TEXTS = {
+    "Hardware Instability": "The RealSense camera gave a short hardware message when its stream started.",
+    "Half image rate": "The mirrorless camera repeated each image in 2 frames, so the video has about half of the expected images.",
+    "error": "The file cannot be read.",
+    "missing_stream": "A camera stream is not in the recording.",
+    "fps": "The frame rate setting of the recording is not the expected value.",
+    "size": "The image size is not the expected value.",
+    "format": "The image format is not the expected format.",
+    "serial_number": "The RealSense camera is not one of the known studio cameras.",
+    "unexpected_stream": "The recording has a stream that it must not have.",
+    "missing_frame": "Some frames of one camera stream are missing.",
+    "duplicate_image": "Some frames repeat the previous image.",
+    "frame_number_gaps": "The RealSense camera skipped some frame numbers, so some frames are lost.",
+    "barcode_gaps": "The mirrorless camera skipped some frame numbers, so some frames are lost.",
+    "timestamp_gaps": "The video has long time gaps between frames, so some frames are lost.",
+    "color_depth_offset": "In some frames, the color image and the depth image were not taken at the same time.",
+    "constant_value": "A camera value changed during the recording. This value must stay the same.",
+    "decreasing_barcode": "The frame numbers of the mirrorless camera go back.",
+    "decreasing_frame_number": "The frame numbers of the RealSense camera go back.",
+    "depth_to_color": "The recording does not have the data that aligns the depth image with the color image.",
+    "dropped_capture_frames": "The recording software reported lost frames from the capture card.",
+    "duplicate_barcode": "The mirrorless camera gave the same frame number 2 times.",
+    "duplicate_frame_number": "The RealSense camera gave the same frame number 2 times.",
+    "frames_not_loaded": "Some frames in the file cannot be used.",
+    "image_fps": "The video has fewer different images per second than expected.",
+    "measured_fps": "The measured frame rate is not the expected value.",
+    "metadata_keys": "Some frames have different frame information than the first frame.",
+    "missing_barcode": "Some frames of the mirrorless camera have no readable frame number.",
+    "missing_partner": "The recording of the other camera for this take is not in the folder.",
+    "notification": "The RealSense camera gave a hardware message.",
+    "pair_duration": "The 2 camera recordings of this take have different lengths.",
+    "report": "The report of the recording software cannot be read.",
+    "report_no_frame_drops": "The report of the recording software says that no frames were lost, but some images repeat.",
+    "timestamp_domain": "The RealSense camera times come from the clock of the PC, not from the clock of the camera.",
+    "timestamp_order": "Some frame times are not in order.",
+}
 CURVE_STYLES = [("#2a78d6", (1, 3)), ("#eb6834", (6, 4))]
 PLAYBACK_SPEEDS = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0]
+# the app looks for new and removed recordings in the open folder at this interval
+RESCAN_MS = 3000
 # the jet colormap for depth: dark blue for near, dark red for far
 JET = (np.clip(1.5 - np.abs(4 * np.linspace(0, 1, 256)[:, None] - np.array([3, 2, 1])), 0, 1) * 255).astype(np.uint8)
 
@@ -137,7 +196,17 @@ ISSUE_DETAIL_LINES = 3
 
 # auto_load: load the video when a recording is selected; when False, a click on the player loads it
 # last_folder: the folder that was open last; the app opens it at the next start when no folder is given
-DEFAULT_SETTINGS = {"font_point_size": FONT_POINT_SIZE, "auto_load": True, "last_folder": None}
+# severity_levels: the severity of each known group and each check that is not the default (recordings.DEFAULT_SEVERITY_LEVELS)
+# hidden_issues: the known groups and the checks whose issues the issue list does not show; they still count in the status and the colors
+# details: the full view (the Details box); off: the simple view
+DEFAULT_SETTINGS = {
+    "font_point_size": FONT_POINT_SIZE,
+    "auto_load": True,
+    "last_folder": None,
+    "severity_levels": {},
+    "hidden_issues": [],
+    "details": False,
+}
 
 
 def load_settings() -> dict[str, Any]:
@@ -176,6 +245,37 @@ def run_summary(run: dict[str, Any]) -> str:
     return f"{run_severity(run)}: {count} {'issue' if count == 1 else 'issues'}"
 
 
+# the text and the color of a run in the recording list and the Result box: the verdict in the simple view, the severity and the number
+# of issues in the full view
+def run_label(run: dict[str, Any], details: bool) -> tuple[str, str]:
+    severity = run_severity(run)
+    if details:
+        return run_summary(run), STATUS_COLORS[severity]
+    return VERDICTS[severity], VERDICT_COLORS[VERDICTS[severity]]
+
+
+# the Frames column: "frame 77" for one frame and "30 frames" for more, so that a frame index does not look like a count
+def frames_text(frames: list[int]) -> str:
+    if not frames:
+        return ""
+    return f"frame {frames[0]}" if len(frames) == 1 else f"{len(frames)} frames"
+
+
+# the row of an issue in the simple view: one row for each known group, and one row for each check and stream in no group
+def verdict_key(issue: dict[str, Any], severity: str, group: str | None) -> tuple:
+    return (severity, group) if group else (severity, issue["check"], issue["stream"])
+
+
+# "{1: 5, 3: 123}" of the run lengths measure as "5 runs of 1 frame, 123 runs of 3 frames"
+def run_lengths_text(value: str) -> str:
+    pairs = RUN_LENGTH_PAIR.findall(value)
+    if not pairs:
+        return value
+    return ", ".join(
+        f"{count} {'run' if count == '1' else 'runs'} of {length} {'frame' if length == '1' else 'frames'}" for length, count in pairs
+    )
+
+
 # the text of an issue for the Message column: the last line of the message with no frame, stream, or check name at its start,
 # because the other columns show them; the tooltip of the row and the text box show the full message
 def short_message(issue: dict[str, Any]) -> str:
@@ -185,6 +285,11 @@ def short_message(issue: dict[str, Any]) -> str:
     label, separator, rest = text.partition(": ")
     # "pair duration: ..." is the label of the check pair_duration
     return rest if separator and label.replace(" ", "_") == issue["check"] else text
+
+
+# the settings key of an issue (severity_levels, hidden_issues): its known group, else its check; the group wins over the check
+def issue_key(issue: dict[str, Any], issues: list[dict[str, Any]]) -> str:
+    return issue_group(issue, issues) or issue["check"]
 
 
 # the last validation run of each recording; a file of an older version of the app has a list of runs for each recording, and its
@@ -266,15 +371,16 @@ class Frames:
         depth = self.loaded.frames[i].depth
         return self.depth_colors[depth.frame] if depth is not None else None
 
-    # the frame index starts at 0, as in the frame lists of the validation issues
+    # the frame index starts at 0, as in the frame lists of the validation issues; the frame_number of a stream is the number that
+    # the camera gave the frame
     def info(self, i: int) -> str:
-        text = f"frame {i} of {self.count - 1}, {self.times_ms[i] / 1000:.3f} s"
+        text = f"frame {i} (0 to {self.count - 1}), {self.times_ms[i] / 1000:.3f} s"
         if isinstance(self.loaded, (list, Mp4Video)):
             return text
         frame = self.loaded.frames[i]
         streams = [("color", frame.color), ("depth", frame.depth)] if self.has_depth else [("color", frame.color)]
         for name, stream in streams:
-            text += f", {name} #{stream.frame_number}" if stream is not None else f", {name} MISSING"
+            text += f", {name} frame_number {stream.frame_number}" if stream is not None else f", {name} MISSING"
         return text
 
 
@@ -438,13 +544,15 @@ def draw_correlation(axes: Axes, result: dict, legend_size: float | None = None,
             axes.plot(shifts, curve["values"], color=color, linewidth=2, label=f"{curve['label']}: no value")
             continue
         peak_shift, peak_value = curve["peak"]
-        axes.plot(shifts, curve["values"], color=color, linewidth=2, label=f"{curve['label']}: peak {peak_shift:+d}, r {peak_value:.3f}")
+        label = f"{curve['label']}: peak at {peak_shift:+d} frames, r {peak_value:.3f}"
+        axes.plot(shifts, curve["values"], color=color, linewidth=2, label=label)
         axes.axvline(peak_shift, color=color, linewidth=2, linestyle=(0, dashes))
         # a label with the values at the peak; on the right half of the plot, the label is on the left side of the line
         right_half = peak_shift > (shifts[0] + shifts[-1]) / 2
         axes.plot(peak_shift, peak_value, "o", color=color, markersize=6)
         # with no legend, the label also names the curve
-        text = f"shift {peak_shift:+d}, r {peak_value:.3f}" if with_legend else f"{curve['label']}: shift {peak_shift:+d}, r {peak_value:.3f}"
+        shift_text = f"shift {peak_shift:+d} frames, r {peak_value:.3f}"
+        text = shift_text if with_legend else f"{curve['label']}: {shift_text}"
         axes.annotate(
             text, xy=(peak_shift, peak_value), xytext=(-6 if right_half else 6, 6),
             textcoords="offset points", ha="right" if right_half else "left", va="bottom", color=color, fontsize=legend_size,
@@ -544,7 +652,53 @@ class SettingsDialog(QDialog):
         layout = QFormLayout(self)
         layout.addRow("Font size", self.size_box)
         layout.addRow(self.auto_load_box)
+        layout.addRow(self.checks_box(set(window.settings["hidden_issues"])))
         layout.addRow(buttons)
+
+    # one row for each known group and each check, in a box that scrolls: the severity list and the Show box; the stored results get the
+    # new levels with no new validation
+    def checks_box(self, hidden: set[str]) -> QGroupBox:
+        self.level_boxes: dict[str, QComboBox] = {}
+        self.show_boxes: dict[str, QCheckBox] = {}
+        rows = QWidget()
+        rows_layout = QFormLayout(rows)
+        for key, default in DEFAULT_SEVERITY_LEVELS.items():
+            box = QComboBox()
+            box.addItems(LEVELS + ([BY_LOST_FRAMES] if default == BY_LOST_FRAMES else []))
+            box.setCurrentText(severity_levels[key])
+            tooltip = f"Default: {default}."
+            if key == "duplicate_image":
+                tooltip += f" {BY_LOST_FRAMES}: medium for copies in up to 5% of the frames, critical for more."
+            elif default == BY_LOST_FRAMES:
+                tooltip += f" {BY_LOST_FRAMES}: medium for 1 or 2 lost frames in the file, critical for more."
+            if key in GROUP_ABOUT:
+                tooltip += f" A known group: {GROUP_ABOUT[key]}"
+            label = QLabel(key)
+            label.setToolTip(tooltip)
+            box.setToolTip(tooltip)
+            show_box = QCheckBox("Show")
+            show_box.setChecked(key not in hidden)
+            show_box.setToolTip("Show these issues in the issue list. A hidden issue still counts in the status and the colors.")
+            row = QHBoxLayout()
+            row.addWidget(box, 1)
+            row.addWidget(show_box)
+            rows_layout.addRow(label, row)
+            self.level_boxes[key] = box
+            self.show_boxes[key] = show_box
+        area = QScrollArea()
+        area.setWidget(rows)
+        area.setWidgetResizable(True)
+        area.setMinimumHeight(10 * box.sizeHint().height())
+        group = QGroupBox("Checks")
+        QVBoxLayout(group).addWidget(area)
+        return group
+
+    # the levels that are not the default
+    def changed_levels(self) -> dict[str, str]:
+        return {key: box.currentText() for key, box in self.level_boxes.items() if box.currentText() != DEFAULT_SEVERITY_LEVELS[key]}
+
+    def hidden_issues(self) -> list[str]:
+        return [key for key, box in self.show_boxes.items() if not box.isChecked()]
 
 
 def table(columns: list[tuple[str, str]]) -> QTableWidget:
@@ -560,6 +714,24 @@ def table(columns: list[tuple[str, str]]) -> QTableWidget:
     widget.setTextElideMode(Qt.TextElideMode.ElideRight)
     widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     widget.horizontalHeader().setStretchLastSection(True)
+    return widget
+
+
+# the issue list: one item for each group, with its issues under it; a click on a group opens or closes it
+def issue_tree(columns: list[tuple[str, str]]) -> QTreeWidget:
+    widget = QTreeWidget()
+    widget.setColumnCount(len(columns))
+    widget.setHeaderLabels([name for name, _ in columns])
+    for column, (_, tooltip) in enumerate(columns):
+        widget.headerItem().setToolTip(column, tooltip)
+    widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    widget.setWordWrap(False)
+    widget.setTextElideMode(Qt.TextElideMode.ElideRight)
+    widget.setUniformRowHeights(True)
+    widget.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    widget.header().setStretchLastSection(True)
+    # a click on the arrow of a group does not send itemClicked; a double click is 2 clicks, so it does not toggle the group again
+    widget.setExpandsOnDoubleClick(False)
     return widget
 
 
@@ -606,8 +778,13 @@ class MainWindow(QMainWindow):
         self.timer.setSingleShot(True)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.play_step)
+        self.rescan_timer = QTimer(self)
+        self.rescan_timer.setInterval(RESCAN_MS)
+        self.rescan_timer.timeout.connect(self.rescan_folder)
         self.settings = load_settings()
+        set_severity_levels(self.settings["severity_levels"])
         self.build_ui()
+        self.apply_view()
         self.apply_font_size(self.settings["font_point_size"])
         if folder is not None:
             self.open_folder(folder)
@@ -648,9 +825,16 @@ class MainWindow(QMainWindow):
         self.correlate_button.clicked.connect(self.correlate_selected)
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self.open_settings)
+        # on: the full view for the admin; off: the simple view for the people who record
+        self.details_box = QCheckBox("Details")
+        self.details_box.setToolTip("Show the full result: each issue with its check and severity, the Measures tab, and the "
+                                    "Cross-correlation tab.")
+        self.details_box.setChecked(self.settings["details"])
+        self.details_box.toggled.connect(self.set_details)
         folder_row = QHBoxLayout()
         folder_row.addWidget(open_button, 1)
         folder_row.addWidget(settings_button)
+        folder_row.addWidget(self.details_box)
         # the busy bar moves and Cancel shows while a validation or a cross-correlation runs
         self.task_bar = busy_bar()
         self.cancel_button = QPushButton("Cancel")
@@ -727,9 +911,10 @@ class MainWindow(QMainWindow):
 
         issue_tab = QWidget()
         issue_layout = QVBoxLayout(issue_tab)
-        self.issue_table = table(ISSUE_COLUMNS)
-        self.issue_table.itemSelectionChanged.connect(self.select_issue)
-        self.row_padding = self.issue_table.verticalHeader().defaultSectionSize() - self.issue_table.verticalHeader().fontMetrics().height()
+        self.issue_tree = issue_tree(ISSUE_COLUMNS)
+        self.issue_tree.itemSelectionChanged.connect(self.select_issue)
+        self.issue_tree.itemClicked.connect(self.toggle_issue_group)
+        self.row_padding = self.measure_table.verticalHeader().defaultSectionSize() - self.measure_table.verticalHeader().fontMetrics().height()
         self.issue_detail = QPlainTextEdit()
         self.issue_detail.setReadOnly(True)
         issue_controls = QHBoxLayout()
@@ -740,7 +925,7 @@ class MainWindow(QMainWindow):
         issue_controls.addWidget(self.issue_previous_button)
         issue_controls.addWidget(self.issue_frame_label, 1, Qt.AlignmentFlag.AlignCenter)
         issue_controls.addWidget(self.issue_next_button)
-        issue_layout.addWidget(self.issue_table, 1)
+        issue_layout.addWidget(self.issue_tree, 1)
         issue_layout.addWidget(self.issue_detail)
         issue_layout.addLayout(issue_controls)
 
@@ -767,9 +952,9 @@ class MainWindow(QMainWindow):
 
     # the row height follows the font: the font height and the padding that Qt gave the rows at the start
     def refresh_table_sizes(self) -> None:
-        for table in [self.measure_table, self.issue_table]:
-            header = table.verticalHeader()
-            header.setDefaultSectionSize(header.fontMetrics().height() + self.row_padding)
+        # the issue list gets its row height from the font
+        header = self.measure_table.verticalHeader()
+        header.setDefaultSectionSize(header.fontMetrics().height() + self.row_padding)
         # ISSUE_DETAIL_LINES full lines; a longer message (an error trace) scrolls
         margins = 2 * (self.issue_detail.document().documentMargin() + self.issue_detail.frameWidth())
         self.issue_detail.setMaximumHeight(round(self.issue_detail.fontMetrics().lineSpacing() * ISSUE_DETAIL_LINES + margins))
@@ -781,8 +966,18 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.apply_font_size(size_before)
             return
-        self.settings |= {"font_point_size": dialog.size_box.value(), "auto_load": dialog.auto_load_box.isChecked()}
+        self.settings |= {
+            "font_point_size": dialog.size_box.value(),
+            "auto_load": dialog.auto_load_box.isChecked(),
+            "severity_levels": dialog.changed_levels(),
+            "hidden_issues": dialog.hidden_issues(),
+        }
         save_settings(self.settings)
+        # the colors of the recording list and the result panel come from the levels
+        set_severity_levels(self.settings["severity_levels"])
+        for path in self.recording_items:
+            self.refresh_item(path)
+        self.show_result(self.requested)
 
     def choose_folder(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Open a recording folder", str(self.folder or ""))
@@ -793,15 +988,29 @@ class MainWindow(QMainWindow):
         self.folder = folder
         self.settings["last_folder"] = str(folder.absolute())
         save_settings(self.settings)
-        self.recordings = find_recordings(folder)
         # a zero-width space after each separator lets a long path wrap
         self.folder_label.setText(str(folder).replace("\\", "\\\u200b").replace("/", "/\u200b"))
+        takes = self.fill_recording_list(find_recordings(folder), keep_view=False)
+        self.statusBar().showMessage(f"{len(self.recordings)} recordings in {takes} takes in {folder}")
+        self.rescan_timer.start()
+        if self.recordings:
+            self.select_path(self.recordings[0])
+
+    # puts the takes of recordings in the list and returns the number of takes; with keep_view, the takes that were open stay open,
+    # the selected file stays selected with no new load, and the list keeps its scroll position
+    def fill_recording_list(self, recordings: list[Path], keep_view: bool) -> int:
+        top_items = [self.recording_list.topLevelItem(i) for i in range(self.recording_list.topLevelItemCount())]
+        expanded = {item.data(0, TAKE_LABEL_ROLE) for item in top_items if item.isExpanded()} if keep_view else set()
+        current = self.recording_list.currentItem()
+        current_path = current.data(0, PATH_ROLE) if keep_view and current is not None else None
+        scroll = self.recording_list.verticalScrollBar().value()
+        self.recordings = recordings
         # clear() sends item changes with items of the previous list, which are not in the new self.recordings, so the list sends no
         # signal while it changes
         self.recording_list.blockSignals(True)
         self.recording_list.clear()
         self.recording_items = {}
-        takes = group_takes(folder, self.recordings)
+        takes = group_takes(self.folder, recordings)
         for label, paths in takes:
             take_item = QTreeWidgetItem(self.recording_list)
             take_item.setData(0, PATH_ROLE, None)
@@ -811,10 +1020,22 @@ class MainWindow(QMainWindow):
                 item.setData(0, PATH_ROLE, str(path))
                 self.recording_items[path] = item
                 self.refresh_item(path)
+            take_item.setExpanded(label in expanded)
+        if current_path is not None and Path(current_path) in self.recording_items:
+            self.recording_list.setCurrentItem(self.recording_items[Path(current_path)])
         self.recording_list.blockSignals(False)
-        self.statusBar().showMessage(f"{len(self.recordings)} recordings in {len(takes)} takes in {folder}")
-        if self.recordings:
-            self.select_path(self.recordings[0])
+        if keep_view:
+            self.recording_list.verticalScrollBar().setValue(scroll)
+        return len(takes)
+
+    # a new or removed recording in the open folder changes the list; the open recording and its player do not change
+    def rescan_folder(self) -> None:
+        if self.folder is None or not self.folder.is_dir():
+            return
+        recordings = find_recordings(self.folder)
+        if recordings != self.recordings:
+            takes = self.fill_recording_list(recordings, keep_view=True)
+            self.statusBar().showMessage(f"the list changed: {len(recordings)} recordings in {takes} takes in {self.folder}")
 
     # opens the take of the file and selects the file, which loads it
     def select_path(self, path: Path) -> None:
@@ -827,21 +1048,49 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         run = self.last_runs.get(path)
-        status = f"  [{run_summary(run)}]" if run else ""
+        text, color = run_label(run, self.settings["details"]) if run else ("", "")
+        status = f"  [{text}]" if run else ""
         item.setText(0, file_label(path) + status)
         item.setToolTip(0, path.relative_to(self.folder).as_posix() + status)
-        item.setForeground(0, QColor(STATUS_COLORS[run_severity(run)]) if run else self.palette().text().color())
+        item.setForeground(0, QColor(color) if run else self.palette().text().color())
         self.refresh_take(item.parent())
 
     # a take shows the worst severity of the last runs of its files; a take with no validated file shows only its name
     def refresh_take(self, take_item: QTreeWidgetItem) -> None:
         paths = [Path(take_item.child(i).data(0, PATH_ROLE)) for i in range(take_item.childCount())]
         severities = {run_severity(run) for run in (self.last_runs.get(path) for path in paths) if run}
-        worst = next((severity for severity in ["critical", "medium", "OK"] if severity in severities), None)
+        worst = next((severity for severity in ["critical", "medium", "low", "OK"] if severity in severities), None)
         label = take_item.data(0, TAKE_LABEL_ROLE)
-        take_item.setText(0, f"{label}  [{worst}]" if worst else label)
         take_item.setToolTip(0, "\n".join(path.relative_to(self.folder).as_posix() for path in paths))
-        take_item.setForeground(0, QColor(STATUS_COLORS[worst]) if worst else self.palette().text().color())
+        if worst is None:
+            take_item.setText(0, label)
+            take_item.setForeground(0, self.palette().text().color())
+            return
+        # the simple view shows the verdict of the worst severity
+        text, color = (worst, STATUS_COLORS[worst]) if self.settings["details"] else (VERDICTS[worst], VERDICT_COLORS[VERDICTS[worst]])
+        take_item.setText(0, f"{label}  [{text}]")
+        take_item.setForeground(0, QColor(color))
+
+    def set_details(self, checked: bool) -> None:
+        self.settings["details"] = checked
+        save_settings(self.settings)
+        self.apply_view()
+
+    # the parts of the full view: the Cross-correlation button, the Measures and Cross-correlation tabs, and the Stream and Message
+    # columns of the issue list; the recording list and the result get the labels of the view
+    def apply_view(self) -> None:
+        details = self.settings["details"]
+        self.correlate_button.setVisible(details)
+        self.tabs.setTabVisible(self.tabs.indexOf(self.measure_table), details)
+        self.tabs.setTabVisible(self.tabs.indexOf(self.thumbnail), details)
+        header = self.issue_tree.headerItem()
+        header.setText(0, ISSUE_COLUMNS[0][0] if details else "Issue")
+        header.setToolTip(0, ISSUE_COLUMNS[0][1] if details else "What the validation found. Select a row to see more and to go to its frames.")
+        for column in (1, 3):
+            self.issue_tree.setColumnHidden(column, not details)
+        for path in self.recording_items:
+            self.refresh_item(path)
+        self.show_result(self.requested)
 
     def toggle_take(self, item: QTreeWidgetItem) -> None:
         if item.data(0, PATH_ROLE) is None:
@@ -1048,7 +1297,7 @@ class MainWindow(QMainWindow):
     # the last run of the file: the status, the measures, and the issues with the critical issues first
     def show_result(self, path: Path | None) -> None:
         self.measure_table.setRowCount(0)
-        self.issue_table.setRowCount(0)
+        self.issue_tree.clear()
         self.issue_detail.clear()
         self.set_issue_frames([])
         run = self.last_runs.get(path) if path is not None else None
@@ -1058,8 +1307,9 @@ class MainWindow(QMainWindow):
             self.validated_label.setText("click Validate selected" if path is not None else "")
             self.tabs.setTabText(0, "Issues")
             return
-        self.status_label.setText(run_summary(run))
-        self.status_label.setStyleSheet(f"color: {STATUS_COLORS[run_severity(run)]}")
+        text, color = run_label(run, self.settings["details"])
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}")
         self.validated_label.setText(f"validated {run['validated_at'].replace('T', ' ')}")
         self.fill_measure_table(run)
         if run["error"]:
@@ -1067,22 +1317,92 @@ class MainWindow(QMainWindow):
         else:
             # sorted() keeps the check order inside each severity
             rows = sorted(run["issues"], key=lambda issue: issue_severity(issue, run["issues"]) != "critical")
-        self.tabs.setTabText(0, f"Issues ({len(rows)})")
+        # each issue with its severity and its known group, in the order of the rows; the Settings dialog hides the issues of some
+        # groups and checks; a read error always shows
+        hidden = set(self.settings["hidden_issues"])
+        members, hidden_members = [], []
         for issue in rows:
-            row = self.issue_table.rowCount()
-            self.issue_table.insertRow(row)
-            frames = issue["frames"]
-            frames_text = "" if not frames else str(frames[0]) if len(frames) == 1 else f"{len(frames)} frames"
-            # the row has the color of its severity, so that the issues that make the file critical are clear
-            severity = "critical" if run["error"] else issue_severity(issue, run["issues"])
-            for column, text in enumerate([issue["check"], issue["stream"] or "", frames_text, short_message(issue)]):
-                item = QTableWidgetItem(text)
-                item.setForeground(QColor(STATUS_COLORS[severity]))
-                item.setToolTip(f"{severity}: {issue['message']}")
-                item.setData(Qt.ItemDataRole.UserRole, issue)
-                self.issue_table.setItem(row, column, item)
-        if rows:
-            self.issue_table.selectRow(0)
+            member = (issue, "critical" if run["error"] else issue_severity(issue, run["issues"]), issue_group(issue, run["issues"]))
+            shown = run["error"] or issue_key(issue, run["issues"]) not in hidden
+            (members if shown else hidden_members).append(member)
+        # the tab counts the issue rows of the view: in the simple view, one row can hold many issues
+        if self.settings["details"]:
+            self.fill_issue_groups(members)
+            shown_count, hidden_count = len(members), len(hidden_members)
+        else:
+            self.fill_issue_verdicts(members)
+            shown_count = len({verdict_key(*member) for member in members})
+            hidden_count = len({verdict_key(*member) for member in hidden_members})
+        self.tabs.setTabText(0, f"Issues ({shown_count}, {hidden_count} hidden)" if hidden_count else f"Issues ({shown_count})")
+        # the first issue of the first open row
+        top = next((item for item in map(self.issue_tree.topLevelItem, range(self.issue_tree.topLevelItemCount())) if item.isExpanded()), None)
+        if top is not None and top.childCount():
+            self.issue_tree.setCurrentItem(top.child(0))
+
+    # the full view: one row for each known group (and No group), with each issue under it
+    def fill_issue_groups(self, members: list[tuple[dict[str, Any], str, str | None]]) -> None:
+        groups: dict[str, list[tuple[dict[str, Any], str]]] = {}
+        for issue, severity, group in members:
+            groups.setdefault(group or NO_GROUP, []).append((issue, severity))
+        # the group with the worst issue first; sorted() keeps the order of the rows for groups of the same severity
+        for group, members in sorted(groups.items(), key=lambda entry: min(LEVELS.index(severity) for _, severity in entry[1])):
+            worst = LEVELS[min(LEVELS.index(severity) for _, severity in members)]
+            count = len(members)
+            group_item = QTreeWidgetItem(self.issue_tree)
+            group_item.setText(0, f"{group}  [{worst}: {count} {'issue' if count == 1 else 'issues'}]")
+            group_item.setFirstColumnSpanned(True)
+            group_item.setForeground(0, QColor(STATUS_COLORS[worst]))
+            group_item.setToolTip(0, GROUP_ABOUT.get(group, "The issues that are in no known group."))
+            group_item.setData(0, ISSUE_ROLE, None)
+            for issue, severity in members:
+                label = severity if group == NO_GROUP else f"{severity}, {group}"
+                item = QTreeWidgetItem(group_item, [issue["check"], issue["stream"] or "", frames_text(issue["frames"]), short_message(issue)])
+                item.setData(0, ISSUE_ROLE, issue)
+                # the row has the color of its severity, so that the issues that make the file critical are clear
+                for column in range(len(ISSUE_COLUMNS)):
+                    item.setForeground(column, QColor(STATUS_COLORS[severity]))
+                    item.setToolTip(column, f"{label}: {issue['message']}")
+            group_item.setExpanded(True)
+
+    # the simple view: a row for each verdict (Problem, Check, and the closed Other notes row for the low issues), with one plain item
+    # for each known group and for each check and stream in no group (their issues together)
+    def fill_issue_verdicts(self, members: list[tuple[dict[str, Any], str, str | None]]) -> None:
+        entries: dict[str, list[dict[str, Any]]] = {"critical": [], "medium": [], "low": []}
+        by_key: dict[tuple, dict[str, Any]] = {}
+        for issue, severity, group in members:
+            key = verdict_key(issue, severity, group)
+            if key in by_key:
+                entry = by_key[key]
+                entry["frames"] = sorted(set(entry["frames"]) | set(issue["frames"]))
+                entry["message"] += "\n" + issue["message"]
+                continue
+            stream = f" ({issue['stream']})" if issue["stream"] and group is None else ""
+            entry = {
+                "check": group or issue["check"],
+                "stream": issue["stream"],
+                "frames": list(issue["frames"]),
+                "message": issue["message"],
+                "plain": PLAIN_TEXTS.get(group or issue["check"], (group or issue["check"]).replace("_", " ")) + stream,
+            }
+            by_key[key] = entry
+            entries[severity].append(entry)
+        for severity, title in [("critical", "Problem"), ("medium", "Check"), ("low", OTHER_NOTES)]:
+            if not entries[severity]:
+                continue
+            row_item = QTreeWidgetItem(self.issue_tree)
+            row_item.setText(0, f"{title} ({len(entries[severity])})")
+            row_item.setFirstColumnSpanned(True)
+            if title in VERDICT_COLORS:
+                row_item.setForeground(0, QColor(VERDICT_COLORS[title]))
+            else:
+                row_item.setToolTip(0, "Minor notes. They do not make the take a problem.")
+            row_item.setData(0, ISSUE_ROLE, None)
+            for entry in entries[severity]:
+                item = QTreeWidgetItem(row_item, [entry["plain"], "", frames_text(entry["frames"]), ""])
+                item.setData(0, ISSUE_ROLE, entry)
+                item.setToolTip(0, entry["plain"])
+            # the Problem and Check rows are open; the Other notes row is closed
+            row_item.setExpanded(title != OTHER_NOTES)
 
     # a run of an older version of the app has no measures, only the printed lines; each line fills one row
     def fill_measure_table(self, run: dict[str, Any]) -> None:
@@ -1096,30 +1416,41 @@ class MainWindow(QMainWindow):
         for values in run["measures"]:
             row = self.measure_table.rowCount()
             self.measure_table.insertRow(row)
-            for column, text in enumerate([values["stream"], values["name"], values["value"]]):
+            value = run_lengths_text(values["value"]) if values["name"] == "run lengths" else values["value"]
+            for column, text in enumerate([values["stream"], values["name"], value]):
                 item = QTableWidgetItem(text)
                 item.setToolTip(MEASURE_ABOUT.get(values["name"], ""))
                 self.measure_table.setItem(row, column, item)
 
+    # a group item is not an issue, so it clears the text box and the issue frames
     def select_issue(self) -> None:
-        items = self.issue_table.selectedItems()
+        items = self.issue_tree.selectedItems()
         if not items:
             return
-        issue = items[0].data(Qt.ItemDataRole.UserRole)
-        self.issue_detail.setPlainText(issue["message"])
+        issue = items[0].data(0, ISSUE_ROLE)
+        if issue is None:
+            self.issue_detail.clear()
+            self.set_issue_frames([])
+            return
+        # an item of the simple view has a plain text before the message of the check
+        self.issue_detail.setPlainText(f"{issue['plain']}\n\n{issue['message']}" if "plain" in issue else issue["message"])
         self.set_issue_frames(issue["frames"])
         if self.issue_frames:
             self.go_to_issue_frame()
+
+    def toggle_issue_group(self, item: QTreeWidgetItem) -> None:
+        if item.parent() is None:
+            item.setExpanded(not item.isExpanded())
 
     def set_issue_frames(self, frames: list[int]) -> None:
         self.issue_frames, self.issue_position = frames, 0
         self.issue_previous_button.setEnabled(len(frames) > 1)
         self.issue_next_button.setEnabled(len(frames) > 1)
-        self.issue_frame_label.setText(f"frame {frames[0]} (1 of {len(frames)})" if frames else "")
+        self.issue_frame_label.setText(f"frame {frames[0]} (issue frame 1 of {len(frames)})" if frames else "")
 
     def go_to_issue_frame(self) -> None:
         frame = self.issue_frames[self.issue_position]
-        self.issue_frame_label.setText(f"frame {frame} ({self.issue_position + 1} of {len(self.issue_frames)})")
+        self.issue_frame_label.setText(f"frame {frame} (issue frame {self.issue_position + 1} of {len(self.issue_frames)})")
         if self.frames is not None and self.frames.path == self.requested:
             self.pause()
             self.show_frame(frame)

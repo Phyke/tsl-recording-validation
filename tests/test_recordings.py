@@ -14,11 +14,13 @@ from recordings import (
     file_label,
     find_partner,
     group_takes,
+    issue_group,
     issue_severity,
     load_recording,
     pair_issues,
     recording_duration_ms,
     report_issues,
+    run_severity,
     sysmon_lines,
     take_key,
     take_label,
@@ -184,12 +186,30 @@ def test_pair_checks(tmp_path: Path) -> None:
     assert [issue.check for issue in pair_issues(mirrorless)] == ["pair_duration"]
 
 
-def test_copies_have_the_severity_of_lost_frames() -> None:
-    def duplicate_image(frames: list[int]) -> dict:
-        return {"check": "duplicate_image", "stream": "color", "frames": frames, "message": ""}
+def test_copies_in_up_to_5_percent_of_the_frames_are_medium() -> None:
+    def duplicate_image(copies: int, frames: int) -> dict:
+        indices = list(range(1, 3 * copies, 3))
+        message = f"color.frame: the same image as the previous frame in {copies} of {frames} frames: {indices}"
+        return {"check": "duplicate_image", "stream": "color", "frames": indices, "message": message}
 
-    assert issue_severity(duplicate_image([3, 5]), []) == "medium"
-    assert issue_severity(duplicate_image([3, 5, 7]), []) == "critical"
+    assert issue_severity(duplicate_image(3, 1000), []) == "medium"
+    assert issue_severity(duplicate_image(50, 1000), []) == "medium"
+    assert issue_severity(duplicate_image(51, 1000), []) == "critical"
+
+
+def test_the_d435_start_notifications_are_low_hardware_instability() -> None:
+    def notification(description: str) -> dict:
+        message = f"notification: {description} (hardware_error, error, Stereo Module), 1 time. What to do: Start the stream again."
+        return {"check": "notification", "stream": None, "frames": [], "message": message}
+
+    for description in ["Left MIPI error", "Right MIPI error", "Depth stream start failure"]:
+        assert issue_group(notification(description)) == "Hardware Instability"
+        assert issue_severity(notification(description), []) == "low"
+    assert issue_group(notification("RT MIPI error")) is None
+    assert issue_severity(notification("RT MIPI error"), []) == "medium"
+    low, medium = notification("Left MIPI error"), notification("RT MIPI error")
+    assert run_severity({"error": None, "issues": [low]}) == "low"
+    assert run_severity({"error": None, "issues": [low, medium]}) == "medium"
 
 
 # a poc1 take: the meta folder is next to the m_1_color folder of the mirrorless .db3 file
