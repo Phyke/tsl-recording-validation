@@ -10,8 +10,10 @@ import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 from PySide6.QtCore import (
     QElapsedTimer,
+    QLocale,
     QObject,
     QPoint,
     QRect,
@@ -23,6 +25,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QImage,
     QKeySequence,
@@ -43,6 +46,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -56,9 +61,10 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
+    QStyle,
+    QStyleOptionSlider,
     QTabWidget,
+    QToolTip,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -72,6 +78,7 @@ from recordings import (
     BY_LOST_FRAMES,
     DEFAULT_SEVERITY_LEVELS,
     GROUP_ABOUT,
+    HALF_IMAGE_RATE_CHECKS,
     LEVELS,
     READ_ERRORS,
     Loaded,
@@ -97,9 +104,10 @@ FONT_POINT_SIZE_RANGE = (8, 40)
 THUMBNAIL_FONT_POINT_SIZE = 10
 THUMBNAIL_MIN_HEIGHT = 100
 MEASURE_COLUMNS = [
-    ("Stream", "The camera stream (color or depth), or PC for the computer of a poc1 take."),
-    ("Measure", "The name of the measure. Put the pointer on a measure to see how it is calculated."),
-    ("Value", "The value of the measure. The measures have no limit, so they give no issue; the checks give the issues."),
+    ("Measure", "The name of the measure, under its camera stream (color or depth), or under PC for the computer of a poc1 take. "
+                "Put the pointer on a measure to see how it is calculated and its full value. Click a stream row to open or close it."),
+    ("Value", "The value of the measure. The measures have no limit, so they give no issue; the checks give the issues. A value in "
+              "the color of a severity is the value of an issue, with the expected value."),
 ]
 # the tooltip of each measure in the Measures table
 MEASURE_ABOUT = {
@@ -126,6 +134,8 @@ MEASURE_ABOUT = {
 }
 # one "length: count" pair of the run lengths measure
 RUN_LENGTH_PAIR = re.compile(r"(\d+): (\d+)")
+# the expected value at the end of an issue message: "color.image_fps: 30.27 (...), expected 120 within 1%"
+EXPECTED_TEXT = re.compile(r"expected (.+)$")
 ISSUE_COLUMNS = [
     ("Check", "The name of the validation check that found the issue. The issues are under their known group. The issues of a "
               "known group have a known cause. Click a group row to open or close it."),
@@ -143,12 +153,7 @@ TAKE_LABEL_ROLE = Qt.ItemDataRole.UserRole + 1
 ISSUE_ROLE = Qt.ItemDataRole.UserRole
 # the group item of the issues that are in no known group
 NO_GROUP = "No group"
-# the simple view (the Details box is off) is for the people who record: one verdict for each severity, and a plain text for each
-# known group and each check
-VERDICTS = {"critical": "Problem", "medium": "Check", "low": "Good", "OK": "Good"}
-VERDICT_COLORS = {"Problem": "#cf222e", "Check": "#d97706", "Good": "#1a7f37"}
-# the simple view puts the low issues in this closed row
-OTHER_NOTES = "Other notes"
+# a plain text for each known group and each check: the Settings dialog shows it under the name
 PLAIN_TEXTS = {
     "Hardware Instability": "The RealSense camera gave a short hardware message when its stream started.",
     "Half image rate": "The mirrorless camera repeated each image in 2 frames, so the video has about half of the expected images.",
@@ -185,7 +190,14 @@ PLAIN_TEXTS = {
     "timestamp_domain": "The RealSense camera times come from the clock of the PC, not from the clock of the camera.",
     "timestamp_order": "Some frame times are not in order.",
 }
-CURVE_STYLES = [("#2a78d6", (1, 3)), ("#eb6834", (6, 4))]
+# the dashes of the peak line of each cross-correlation curve
+CURVE_DASHES = [(1, 3), (6, 4)]
+# the plot colors for a light and a dark app palette; the surface and the text come from the palette (chart_colors); the curve
+# colors are the first 2 colors of the dataviz palette, with the steps of each mode, checked against the surface of each mode
+CHART_COLORS = {
+    "light": {"curves": ["#2a78d6", "#eb6834"], "grid": "#e1e0d9", "axis": "#c3c2b7", "muted": "#898781"},
+    "dark": {"curves": ["#3987e5", "#d95926"], "grid": "#2c2c2a", "axis": "#383835", "muted": "#898781"},
+}
 PLAYBACK_SPEEDS = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0]
 # the app looks for new and removed recordings in the open folder at this interval
 RESCAN_MS = 3000
@@ -197,12 +209,13 @@ JET = (np.clip(1.5 - np.abs(4 * np.linspace(0, 1, 256)[:, None] - np.array([3, 2
 FRAME_PREFIX = re.compile(r"^frame \d+ ")
 # the text box below the issue table shows this number of lines; a longer message scrolls
 ISSUE_DETAIL_LINES = 3
+# the note in the Result box for a run of an older version of the app, which has only the printed lines and no measures
+OLD_RUN_TEXT = "An older version of the app made this result, so the Measures tab has no measures. Click Validate selected to get them."
 
 # auto_load: load the video when a recording is selected; when False, a click on the player loads it
 # last_folder: the folder that was open last; the app opens it at the next start when no folder is given
 # severity_levels: the severity of each known group and each check that is not the default (recordings.DEFAULT_SEVERITY_LEVELS)
 # hidden_issues: the known groups and the checks whose issues the issue list does not show; they still count in the status and the colors
-# details: the full view (the Details box); off: the simple view
 # drawing: the processor that scales the video frames, CPU (ImageView) or GPU (GpuImageView); a change takes effect at the next start
 DEFAULT_SETTINGS = {
     "font_point_size": FONT_POINT_SIZE,
@@ -210,7 +223,6 @@ DEFAULT_SETTINGS = {
     "last_folder": None,
     "severity_levels": {},
     "hidden_issues": [],
-    "details": False,
     "drawing": "CPU",
 }
 DRAWING_MODES = ["CPU", "GPU"]
@@ -248,22 +260,22 @@ def set_app_font_size(size: int) -> None:
     mpl.rcParams["font.size"] = size
 
 
+# the number of issues of each severity, the worst first: "1 critical, 2 medium"
+def severity_counts_text(severities: list[str]) -> str:
+    return ", ".join(f"{severities.count(level)} {level}" for level in LEVELS if level in severities)
+
+
 def run_summary(run: dict[str, Any]) -> str:
     if run["error"]:
         return "critical: validation error"
     if not run["issues"]:
         return "OK"
-    count = len(run["issues"])
-    return f"{run_severity(run)}: {count} {'issue' if count == 1 else 'issues'}"
+    return severity_counts_text([issue_severity(issue, run["issues"]) for issue in run["issues"]])
 
 
-# the text and the color of a run in the recording list and the Result box: the verdict in the simple view, the severity and the number
-# of issues in the full view
-def run_label(run: dict[str, Any], details: bool) -> tuple[str, str]:
-    severity = run_severity(run)
-    if details:
-        return run_summary(run), STATUS_COLORS[severity]
-    return VERDICTS[severity], VERDICT_COLORS[VERDICTS[severity]]
+# the text and the color of a run in the recording list and the Result box: the severity and the number of issues
+def run_label(run: dict[str, Any]) -> tuple[str, str]:
+    return run_summary(run), STATUS_COLORS[run_severity(run)]
 
 
 # the Frames column: "frame 77" for one frame and "30 frames" for more, so that a frame index does not look like a count
@@ -271,11 +283,6 @@ def frames_text(frames: list[int]) -> str:
     if not frames:
         return ""
     return f"frame {frames[0]}" if len(frames) == 1 else f"{len(frames)} frames"
-
-
-# the row of an issue in the simple view: one row for each known group, and one row for each check and stream in no group
-def verdict_key(issue: dict[str, Any], severity: str, group: str | None) -> tuple:
-    return (severity, group) if group else (severity, issue["check"], issue["stream"])
 
 
 # "{1: 5, 3: 123}" of the run lengths measure as "5 runs of 1 frame, 123 runs of 3 frames"
@@ -286,6 +293,19 @@ def run_lengths_text(value: str) -> str:
     return ", ".join(
         f"{count} {'run' if count == '1' else 'runs'} of {length} {'frame' if length == '1' else 'frames'}" for length, count in pairs
     )
+
+
+# the issues of a measure: a check names the measure at the start of its message, "color.image_fps: 30.27 ..." for the image fps
+# of the color stream, and "color.camera_fps: ..." for the camera fps
+def measure_issues(values: dict[str, str], issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    prefix = f"{values['stream']}.{values['name'].replace(' ', '_')}: "
+    return [issue for issue in issues if issue["message"].startswith(prefix)]
+
+
+# the value of a measure with the expected value of its first issue: "30.27 (expected 120 within 1%)"
+def value_with_expected(value: str, issues: list[dict[str, Any]]) -> str:
+    expected = EXPECTED_TEXT.search(issues[0]["message"].splitlines()[0]) if issues else None
+    return f"{value} (expected {expected.group(1)})" if expected else value
 
 
 # the text of an issue for the Message column: the last line of the message with no frame, stream, or check name at its start,
@@ -600,9 +620,33 @@ class GpuImageView(QOpenGLWidget):
         self.clicked.emit()
 
 
+# the plot colors of the app palette: a dark window gives the dark colors
+def chart_colors() -> dict[str, Any]:
+    palette = QApplication.palette()
+    surface = palette.color(QPalette.ColorRole.Window)
+    mode = "dark" if surface.lightness() < 128 else "light"
+    return CHART_COLORS[mode] | {"surface": surface.name(), "ink": palette.color(QPalette.ColorRole.WindowText).name()}
+
+
+# the matplotlib settings for a plot in the colors of the app; a figure gets its color when it is made, so set_chart_surface sets
+# the color of a figure that is already there
+def chart_style(colors: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "figure.facecolor": colors["surface"], "axes.facecolor": colors["surface"], "axes.edgecolor": colors["axis"],
+        "axes.labelcolor": colors["ink"], "axes.titlecolor": colors["ink"], "text.color": colors["ink"], "xtick.color": colors["muted"],
+        "ytick.color": colors["muted"], "xtick.labelcolor": colors["ink"], "ytick.labelcolor": colors["ink"], "grid.color": colors["grid"],
+        "legend.edgecolor": colors["axis"],
+    }
+
+
+def set_chart_surface(figure: Figure, colors: dict[str, Any]) -> None:
+    figure.set_facecolor(colors["surface"])
+
+
 def draw_correlation(axes: Axes, result: dict, legend_size: float | None = None, with_legend: bool = True) -> None:
+    colors = chart_colors()
     shifts = result["shifts"]
-    for curve, (color, dashes) in zip(result["curves"], CURVE_STYLES, strict=False):
+    for curve, color, dashes in zip(result["curves"], colors["curves"], CURVE_DASHES, strict=False):
         if curve["peak"] is None:
             axes.plot(shifts, curve["values"], color=color, linewidth=2, label=f"{curve['label']}: no value")
             continue
@@ -616,16 +660,17 @@ def draw_correlation(axes: Axes, result: dict, legend_size: float | None = None,
         # with no legend, the label also names the curve
         shift_text = f"shift {peak_shift:+d} frames, r {peak_value:.3f}"
         text = shift_text if with_legend else f"{curve['label']}: {shift_text}"
+        # the text has the text color and the box edge has the curve color, so that the text is easy to read on the surface
         axes.annotate(
             text, xy=(peak_shift, peak_value), xytext=(-6 if right_half else 6, 6),
-            textcoords="offset points", ha="right" if right_half else "left", va="bottom", color=color, fontsize=legend_size,
-            fontweight="bold", bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": color},
+            textcoords="offset points", ha="right" if right_half else "left", va="bottom", color=colors["ink"], fontsize=legend_size,
+            fontweight="bold", bbox={"boxstyle": "round,pad=0.2", "facecolor": colors["surface"], "edgecolor": color},
         )
     # room above the highest peak for its label
     axes.set_ymargin(0.3)
     axes.set_xlim(shifts[0], shifts[-1])
     axes.set_xticks(np.arange(shifts[0], shifts[-1] + 1, 10))
-    axes.grid(color="#e6e5e0")
+    axes.grid(color=colors["grid"])
     if with_legend:
         axes.legend(loc="best", fontsize=legend_size)
 
@@ -640,27 +685,29 @@ class PlotWindow(QWidget):
     def __init__(self, result: dict) -> None:
         super().__init__()
         self.setWindowTitle(f"Cross-correlation: {correlation_title(result).splitlines()[0]}")
-        figure = Figure(layout="constrained")
-        canvas = FigureCanvasQTAgg(figure)
-        layout = QVBoxLayout(self)
-        layout.addWidget(NavigationToolbar2QT(canvas, self))
-        layout.addWidget(canvas)
-        axes = figure.add_subplot()
-        draw_correlation(axes, result)
-        axes.set_xlabel(f"shift k in D435 frames of {result['period_ms']:.1f} ms: second signal at t + k")
-        axes.set_ylabel("correlation of the motion signals")
-        axes.set_title(correlation_title(result))
+        colors = chart_colors()
+        with mpl.rc_context(chart_style(colors)):
+            figure = Figure(layout="constrained")
+            canvas = FigureCanvasQTAgg(figure)
+            layout = QVBoxLayout(self)
+            layout.addWidget(NavigationToolbar2QT(canvas, self))
+            layout.addWidget(canvas)
+            axes = figure.add_subplot()
+            draw_correlation(axes, result)
+            axes.set_xlabel(f"shift k in D435 frames of {result['period_ms']:.1f} ms: second signal at t + k")
+            axes.set_ylabel("correlation of the motion signals")
+            axes.set_title(correlation_title(result))
 
 
-# the small plot in the right panel; a click opens the large plot, or runs the cross-correlation when no plot is there yet
+# the small plot in the right panel; a click opens the large plot; the Cross-correlation button of the left panel runs the
+# cross-correlation
 class CorrelationThumbnail(FigureCanvasQTAgg):
-    def __init__(self, open_large: Any, run_correlation: Any) -> None:
+    def __init__(self, open_large: Any) -> None:
         super().__init__(Figure(layout="constrained"))
-        self.open_large, self.run_correlation = open_large, run_correlation
+        self.open_large = open_large
         self.result: dict | None = None
         self.drawn = False
         self.setMinimumHeight(THUMBNAIL_MIN_HEIGHT)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.show_result(None)
 
     def show_result(self, result: dict | None) -> None:
@@ -668,23 +715,80 @@ class CorrelationThumbnail(FigureCanvasQTAgg):
         if self.drawn and result is self.result:
             return
         self.result, self.drawn = result, True
-        self.setToolTip("click to run the cross-correlation" if result is None else "click to enlarge")
+        self.setToolTip("Click Cross-correlation in the left panel to run it." if result is None else "Click to enlarge.")
+        self.setCursor(Qt.CursorShape.ArrowCursor if result is None else Qt.CursorShape.PointingHandCursor)
         self.figure.clear()
-        with mpl.rc_context({"font.size": THUMBNAIL_FONT_POINT_SIZE}):
+        colors = chart_colors()
+        set_chart_surface(self.figure, colors)
+        with mpl.rc_context(chart_style(colors) | {"font.size": THUMBNAIL_FONT_POINT_SIZE}):
             axes = self.figure.add_subplot()
             if result is None:
                 axes.set_axis_off()
-                axes.text(0.5, 0.5, "no cross-correlation yet\nclick here to run it", ha="center", va="center")
+                axes.text(0.5, 0.5, "No cross-correlation yet.\nClick Cross-correlation in the left panel.", ha="center", va="center")
             else:
                 # the small plot has no legend and no title, so that the curves get the height; the peak labels name the curves
                 draw_correlation(axes, result, THUMBNAIL_FONT_POINT_SIZE, with_legend=False)
         self.draw_idle()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self.result is None:
-            self.run_correlation()
+        if self.result is not None:
+            self.open_large(self.result)
+
+
+# the bar chart of the run lengths measure in the Measures tab: the number of runs of each length of frames with the same image,
+# one plot for each stream with the measure; the chart is hidden when the run has no run lengths
+class RunLengthChart(FigureCanvasQTAgg):
+    def __init__(self) -> None:
+        super().__init__(Figure(layout="constrained"))
+        self.run: dict[str, Any] | None = None
+        self.drawn = False
+        self.bars: list[tuple[Any, str, int, int]] = []
+        self.setMinimumHeight(THUMBNAIL_MIN_HEIGHT)
+        self.mpl_connect("motion_notify_event", self.show_bar_tip)
+        self.hide()
+
+    @staticmethod
+    def run_lengths(run: dict[str, Any] | None) -> list[tuple[str, list[tuple[int, int]]]]:
+        measures = run.get("measures", []) if run else []
+        streams = [(values["stream"], RUN_LENGTH_PAIR.findall(values["value"])) for values in measures if values["name"] == "run lengths"]
+        return [(stream, [(int(length), int(count)) for length, count in pairs]) for stream, pairs in streams if pairs]
+
+    def show_run(self, run: dict[str, Any] | None) -> None:
+        # matplotlib draws slowly, so the chart of the same run is not drawn again
+        if self.drawn and run is self.run:
             return
-        self.open_large(self.result)
+        self.run, self.drawn = run, True
+        streams = self.run_lengths(run)
+        self.setVisible(bool(streams))
+        self.figure.clear()
+        self.bars = []
+        if not streams:
+            return
+        colors = chart_colors()
+        set_chart_surface(self.figure, colors)
+        with mpl.rc_context(chart_style(colors) | {"font.size": THUMBNAIL_FONT_POINT_SIZE}):
+            for n, (stream, pairs) in enumerate(streams, start=1):
+                axes = self.figure.add_subplot(1, len(streams), n)
+                lengths, counts = zip(*pairs, strict=True)
+                drawn = axes.bar(lengths, counts, width=0.6, color=colors["curves"][0])
+                self.bars += [(bar, stream, length, count) for bar, length, count in zip(drawn, lengths, counts, strict=True)]
+                axes.set_title(f"{stream}: runs of frames with the same image")
+                axes.set_xlabel("run length (frames)")
+                axes.set_ylabel("runs")
+                axes.xaxis.set_major_locator(MaxNLocator(integer=True))
+                axes.grid(axis="y", color=colors["grid"])
+                axes.set_axisbelow(True)
+                axes.spines[["top", "right"]].set_visible(False)
+        self.draw_idle()
+
+    # the pointer on a bar shows its values
+    def show_bar_tip(self, event: Any) -> None:
+        for bar, stream, length, count in self.bars:
+            if bar.contains(event)[0]:
+                runs, frames = "run" if count == 1 else "runs", "frame" if length == 1 else "frames"
+                QToolTip.showText(QCursor.pos(), f"{stream}: {count} {runs} of {length} {frames}")
+                return
+        QToolTip.hideText()
 
 
 # a range of 0 to 0 gives a busy bar that moves until it is hidden
@@ -696,7 +800,103 @@ def busy_bar() -> QProgressBar:
     return bar
 
 
+# the strip under the player slider: a mark at each issue frame of the shown issues, in the color of the issue severity, at the
+# position of the frame on the slider; the marks of the selected issue are tall, the other marks are short; a click on a mark goes
+# to its frame
+class IssueStrip(QWidget):
+    frame_clicked = Signal(int)
+    # a click goes to the nearest mark within this distance in pixels
+    CLICK_DISTANCE = 6
+    HEIGHT = 14
+
+    def __init__(self, slider: QSlider) -> None:
+        super().__init__()
+        self.slider = slider
+        self.count = 0
+        self.issues: list[tuple[dict[str, Any], str]] = []
+        self.selected: dict[str, Any] | None = None
+        self.setFixedHeight(self.HEIGHT)
+        self.setToolTip(
+            "The frames of the shown issues, in the color of their severity. The tall marks are the frames of the selected issue. "
+            "Click a mark to go to its frame."
+        )
+
+    def set_count(self, count: int) -> None:
+        self.count = count
+        self.update()
+
+    def set_issues(self, issues: list[tuple[dict[str, Any], str]]) -> None:
+        self.issues, self.selected = issues, None
+        self.update()
+
+    def set_selected(self, issue: dict[str, Any] | None) -> None:
+        self.selected = issue
+        self.update()
+
+    # the x of frame 0 and the distance between 2 frames: frame 0 and the last frame are at the center of the slider handle at its
+    # 2 ends, so that a mark is under the handle at its frame
+    def frame_scale(self) -> tuple[float, float]:
+        option = QStyleOptionSlider()
+        self.slider.initStyleOption(option)
+        handle = self.slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderHandle, self.slider)
+        return handle.width() / 2, (self.width() - handle.width()) / max(self.count - 1, 1)
+
+    # the marks from the lowest severity to the worst, and the selected issue last, so that the worst and the selected marks are on
+    # top; the item data of the issue list can give a copy of an issue, so the selected issue is found by its value
+    def marks(self) -> list[tuple[int, str, bool]]:
+        if self.count == 0:
+            return []
+        order = sorted(self.issues, key=lambda entry: (entry[0] == self.selected, -LEVELS.index(entry[1])))
+        return [(frame, severity, issue == self.selected) for issue, severity in order for frame in issue["frames"] if frame < self.count]
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(QPalette.ColorRole.Mid))
+        painter.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+        start, step = self.frame_scale()
+        for frame, severity, selected in self.marks():
+            painter.setPen(QColor(STATUS_COLORS[severity]))
+            x = round(start + step * frame)
+            painter.drawLine(x, 0 if selected else self.height() // 2, x, self.height() - 1)
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        frames = [frame for frame, _, _ in self.marks()]
+        if not frames:
+            return
+        start, step = self.frame_scale()
+        x = event.position().x()
+        frame = min(frames, key=lambda frame: abs(start + step * frame - x))
+        if abs(start + step * frame - x) <= self.CLICK_DISTANCE:
+            self.frame_clicked.emit(frame)
+
+
 # a new font size applies at once; Cancel puts back the size from before the dialog
+# the checks whose levels a known group wins over (recordings.issue_group): the Settings dialog names them on the row of the group
+GROUP_CHECKS = {"Hardware Instability": ["notification"], "Half image rate": sorted(HALF_IMAGE_RATE_CHECKS)}
+# the source of the values of each check, the section of the check in the Settings dialog: Metadata (what the camera or the
+# recorder wrote into the file), Measured (what the app calculates from the frame numbers, the times, or the images), or Other files
+# (the folder and the poc1 report)
+CHECK_SOURCES = {
+    **dict.fromkeys(
+        [
+            "missing_stream", "unexpected_stream", "fps", "size", "format", "serial_number", "depth_to_color", "timestamp_domain",
+            "constant_value", "metadata_keys", "notification",
+        ],
+        "Metadata",
+    ),
+    **dict.fromkeys(
+        [
+            "measured_fps", "image_fps", "missing_frame", "frame_number_gaps", "barcode_gaps", "timestamp_gaps", "duplicate_image",
+            "duplicate_frame_number", "duplicate_barcode", "decreasing_frame_number", "decreasing_barcode", "missing_barcode",
+            "timestamp_order", "color_depth_offset", "frames_not_loaded", "pair_duration",
+        ],
+        "Measured",
+    ),
+    **dict.fromkeys(["missing_partner", "report", "dropped_capture_frames", "report_no_frame_drops"], "Other files"),
+}
+
+
 class SettingsDialog(QDialog):
     def __init__(self, window: "MainWindow") -> None:
         super().__init__(window)
@@ -716,6 +916,10 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        reset_button = buttons.addButton("Reset to defaults", QDialogButtonBox.ButtonRole.ResetRole)
+        reset_button.setToolTip("Set each setting to its default: the font size, the video load, the drawing, each level, and each Show box. "
+                                "OK saves the change.")
+        reset_button.clicked.connect(self.reset_settings)
         layout = QFormLayout(self)
         layout.addRow("Font size", self.size_box)
         layout.addRow(self.auto_load_box)
@@ -723,14 +927,21 @@ class SettingsDialog(QDialog):
         layout.addRow(self.checks_box(set(window.settings["hidden_issues"])))
         layout.addRow(buttons)
 
-    # one row for each known group and each check, in a box that scrolls: the severity list and the Show box; the stored results get the
-    # new levels with no new validation
+    # one entry for each known group and each check, under a heading (the known groups, then the checks by the source of their values),
+    # in columns that use the width of the screen, in a box that scrolls: the name with its plain text under it, the severity list,
+    # the Default button, and the Show box; the stored results get the new levels with no new validation
     def checks_box(self, hidden: set[str]) -> QGroupBox:
         self.level_boxes: dict[str, QComboBox] = {}
         self.show_boxes: dict[str, QCheckBox] = {}
+        self.name_labels: dict[str, QLabel] = {}
+        self.default_buttons: dict[str, QPushButton] = {}
         rows = QWidget()
-        rows_layout = QFormLayout(rows)
+        grid = QGridLayout(rows)
+        sections: dict[str, list[tuple[QWidget, QComboBox, QPushButton, QCheckBox]]] = {
+            section: [] for section in ["Known groups", "Metadata", "Measured", "Other files"]
+        }
         for key, default in DEFAULT_SEVERITY_LEVELS.items():
+            section = "Known groups" if key in GROUP_ABOUT else CHECK_SOURCES[key]
             box = QComboBox()
             box.addItems(LEVELS + ([BY_LOST_FRAMES] if default == BY_LOST_FRAMES else []))
             box.setCurrentText(severity_levels[key])
@@ -742,24 +953,103 @@ class SettingsDialog(QDialog):
             if key in GROUP_ABOUT:
                 tooltip += f" A known group: {GROUP_ABOUT[key]}"
             label = QLabel(key)
-            label.setToolTip(tooltip)
+            about_text = PLAIN_TEXTS.get(key, "")
+            if key in GROUP_CHECKS:
+                about_text += f" Wins over: {', '.join(GROUP_CHECKS[key])}."
+            about = QLabel(about_text)
+            about.setWordWrap(True)
+            about.setStyleSheet("color: gray")
+            # about 42 characters on one line, so that most plain texts take 1 or 2 lines and 2 columns fit on a 1920 px screen
+            about.setMinimumWidth(42 * about.fontMetrics().averageCharWidth())
+            cell = QWidget()
+            cell.setToolTip(tooltip)
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(0)
+            cell_layout.addWidget(label)
+            cell_layout.addWidget(about)
+            # the name and the plain text stay at the top when the entry next to it in the other column is taller
+            cell_layout.addStretch(1)
             box.setToolTip(tooltip)
             show_box = QCheckBox("Show")
             show_box.setChecked(key not in hidden)
             show_box.setToolTip("Show these issues in the issue list. A hidden issue still counts in the status and the colors.")
-            row = QHBoxLayout()
-            row.addWidget(box, 1)
-            row.addWidget(show_box)
-            rows_layout.addRow(label, row)
+            # shows only when the level is not the default; its space stays when it is hidden, so that the rows do not move; it is a child
+            # of the rows from the start, so that it does not open as a window of its own
+            default_button = QPushButton("Default", rows)
+            default_button.setToolTip(f"Set this level back to its default: {default}.")
+            policy = default_button.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            default_button.setSizePolicy(policy)
+            default_button.clicked.connect(lambda _checked=False, key=key: self.level_boxes[key].setCurrentText(DEFAULT_SEVERITY_LEVELS[key]))
+            sections.setdefault(section, []).append((cell, box, default_button, show_box))
             self.level_boxes[key] = box
             self.show_boxes[key] = show_box
+            self.name_labels[key] = label
+            self.default_buttons[key] = default_button
+            self.mark_change(key)
+            box.currentTextChanged.connect(lambda _text, key=key: self.mark_change(key))
+        # each column has 5 grid columns: the name, the severity list, the Default button, the Show box, and a gap; as many columns as
+        # fit in 90% of the screen width, at most 3
+        entries = [entry for entries in sections.values() for entry in entries]
+        gap = 3 * grid.horizontalSpacing()
+        column_width = sum(max(widget.sizeHint().width() for widget in parts) for parts in zip(*entries)) + 4 * grid.horizontalSpacing() + gap
+        columns = max(1, min(3, int(0.9 * self.screen().availableGeometry().width()) // column_width))
+        for column in range(columns):
+            grid.setColumnStretch(5 * column, 1)
+            if column < columns - 1:
+                grid.setColumnMinimumWidth(5 * column + 4, gap)
+        for section, entries in sections.items():
+            if not entries:
+                continue
+            # a line above each section after the first
+            if grid.rowCount() > 1:
+                line = QFrame()
+                line.setFrameShape(QFrame.Shape.HLine)
+                line.setFrameShadow(QFrame.Shadow.Sunken)
+                grid.addWidget(line, grid.rowCount(), 0, 1, 5 * columns - 1)
+            title = QLabel(section)
+            title.setStyleSheet("font-weight: bold")
+            first_row = grid.rowCount()
+            grid.addWidget(title, first_row, 0, 1, 5 * columns - 1)
+            # the entries of a section go down the first column, then down the next column
+            per_column = -(-len(entries) // columns)
+            for i, (cell, box, default_button, show_box) in enumerate(entries):
+                row, column = first_row + 1 + i % per_column, 5 * (i // per_column)
+                grid.addWidget(cell, row, column)
+                grid.addWidget(box, row, column + 1, Qt.AlignmentFlag.AlignTop)
+                grid.addWidget(default_button, row, column + 2, Qt.AlignmentFlag.AlignTop)
+                grid.addWidget(show_box, row, column + 3, Qt.AlignmentFlag.AlignTop)
         area = QScrollArea()
         area.setWidget(rows)
         area.setWidgetResizable(True)
-        area.setMinimumHeight(10 * box.sizeHint().height())
+        # the list gets the width of its rows and the scroll bar, so it has no horizontal scroll bar, and up to 70% of the screen height
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setMinimumWidth(rows.sizeHint().width() + area.verticalScrollBar().sizeHint().width() + 2 * area.frameWidth())
+        area.setMinimumHeight(min(rows.sizeHint().height(), round(0.7 * self.screen().availableGeometry().height())))
         group = QGroupBox("Checks")
         QVBoxLayout(group).addWidget(area)
         return group
+
+    # a level that is not the default: the name in bold, with the default after it, and the Default button
+    def mark_change(self, key: str) -> None:
+        default = DEFAULT_SEVERITY_LEVELS[key]
+        changed = self.level_boxes[key].currentText() != default
+        label = self.name_labels[key]
+        label.setText(f"{key} (default: {default})" if changed else key)
+        label.setStyleSheet("font-weight: bold" if changed else "")
+        self.default_buttons[key].setVisible(changed)
+
+    # each setting back to its default: the font size (the window shows it at once), the video load, the drawing, each level, and each
+    # Show box; OK saves the change, Cancel keeps the settings from before
+    def reset_settings(self) -> None:
+        self.size_box.setValue(DEFAULT_SETTINGS["font_point_size"])
+        self.auto_load_box.setChecked(DEFAULT_SETTINGS["auto_load"])
+        self.drawing_box.setCurrentText(DEFAULT_SETTINGS["drawing"])
+        for key, box in self.level_boxes.items():
+            box.setCurrentText(DEFAULT_SEVERITY_LEVELS[key])
+        for show_box in self.show_boxes.values():
+            show_box.setChecked(True)
 
     # the levels that are not the default
     def changed_levels(self) -> dict[str, str]:
@@ -769,24 +1059,8 @@ class SettingsDialog(QDialog):
         return [key for key, box in self.show_boxes.items() if not box.isChecked()]
 
 
-def table(columns: list[tuple[str, str]]) -> QTableWidget:
-    widget = QTableWidget(0, len(columns))
-    widget.setHorizontalHeaderLabels([name for name, _ in columns])
-    for column, (_, tooltip) in enumerate(columns):
-        widget.horizontalHeaderItem(column).setToolTip(tooltip)
-    widget.verticalHeader().setVisible(False)
-    widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-    widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-    widget.setWordWrap(False)
-    widget.setTextElideMode(Qt.TextElideMode.ElideRight)
-    widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    widget.horizontalHeader().setStretchLastSection(True)
-    return widget
-
-
-# the issue list: one item for each group, with its issues under it; a click on a group opens or closes it
-def issue_tree(columns: list[tuple[str, str]]) -> QTreeWidget:
+# the issue list and the measure list: one item for each group, with its rows under it; a click on a group opens or closes it
+def group_tree(columns: list[tuple[str, str]]) -> QTreeWidget:
     widget = QTreeWidget()
     widget.setColumnCount(len(columns))
     widget.setHeaderLabels([name for name, _ in columns])
@@ -851,7 +1125,6 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         set_severity_levels(self.settings["severity_levels"])
         self.build_ui()
-        self.apply_view()
         self.apply_font_size(self.settings["font_point_size"])
         if folder is not None:
             self.open_folder(folder)
@@ -886,22 +1159,13 @@ class MainWindow(QMainWindow):
         self.recording_list.itemClicked.connect(self.toggle_take)
         self.validate_selected_button = QPushButton("Validate selected")
         self.validate_selected_button.clicked.connect(self.validate_selected)
-        self.validate_all_button = QPushButton("Validate all")
-        self.validate_all_button.clicked.connect(self.validate_all)
         self.correlate_button = QPushButton("Cross-correlation")
         self.correlate_button.clicked.connect(self.correlate_selected)
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self.open_settings)
-        # on: the full view for the admin; off: the simple view for the people who record
-        self.details_box = QCheckBox("Details")
-        self.details_box.setToolTip("Show the full result: each issue with its check and severity, the Measures tab, and the "
-                                    "Cross-correlation tab.")
-        self.details_box.setChecked(self.settings["details"])
-        self.details_box.toggled.connect(self.set_details)
         folder_row = QHBoxLayout()
         folder_row.addWidget(open_button, 1)
         folder_row.addWidget(settings_button)
-        folder_row.addWidget(self.details_box)
         # the busy bar moves and Cancel shows while a validation or a cross-correlation runs
         self.task_bar = busy_bar()
         self.cancel_button = QPushButton("Cancel")
@@ -913,7 +1177,7 @@ class MainWindow(QMainWindow):
         task_row.addWidget(self.cancel_button)
         layout.addWidget(self.folder_label)
         layout.addLayout(folder_row)
-        for widget in [self.recording_list, self.validate_selected_button, self.validate_all_button, self.correlate_button]:
+        for widget in [self.recording_list, self.validate_selected_button, self.correlate_button]:
             layout.addWidget(widget)
         layout.addLayout(task_row)
         return left
@@ -951,9 +1215,16 @@ class MainWindow(QMainWindow):
         self.speed_combo.currentIndexChanged.connect(self.set_speed)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.valueChanged.connect(self.on_slider)
+        # the issue frames under the slider, with the same width as the slider
+        self.issue_strip = IssueStrip(self.slider)
+        self.issue_strip.frame_clicked.connect(self.go_to_strip_frame)
+        slider_column = QVBoxLayout()
+        slider_column.setSpacing(0)
+        slider_column.addWidget(self.slider)
+        slider_column.addWidget(self.issue_strip)
         for widget in [self.previous_button, self.play_button, self.next_button, self.speed_combo]:
             controls.addWidget(widget)
-        controls.addWidget(self.slider, 1)
+        controls.addLayout(slider_column, 1)
         layout.addLayout(controls)
         return middle
 
@@ -962,7 +1233,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(right)
 
         status_box = QGroupBox("Result")
-        status_layout = QHBoxLayout(status_box)
+        status_column = QVBoxLayout(status_box)
+        status_layout = QHBoxLayout()
         self.status_label = QLabel("not validated")
         # bold; apply_font_size sets the size
         status_font = QFont(self.font())
@@ -973,16 +1245,33 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
         status_layout.addWidget(self.validated_label)
+        # shows for a run of an older version of the app, which has no measures
+        self.old_run_label = QLabel(OLD_RUN_TEXT)
+        self.old_run_label.setWordWrap(True)
+        self.old_run_label.setStyleSheet("color: gray")
+        self.old_run_label.hide()
+        status_column.addLayout(status_layout)
+        status_column.addWidget(self.old_run_label)
 
-        self.measure_table = table(MEASURE_COLUMNS)
-        self.measure_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        measure_tab = QWidget()
+        measure_layout = QVBoxLayout(measure_tab)
+        self.measure_tree = group_tree(MEASURE_COLUMNS)
+        self.measure_tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.measure_tree.itemClicked.connect(self.toggle_group)
+        self.run_length_chart = RunLengthChart()
+        measure_layout.addWidget(self.measure_tree, 3)
+        measure_layout.addWidget(self.run_length_chart, 2)
 
         issue_tab = QWidget()
         issue_layout = QVBoxLayout(issue_tab)
-        self.issue_tree = issue_tree(ISSUE_COLUMNS)
+        self.issue_tree = group_tree(ISSUE_COLUMNS)
         self.issue_tree.itemSelectionChanged.connect(self.select_issue)
-        self.issue_tree.itemClicked.connect(self.toggle_issue_group)
-        self.row_padding = self.measure_table.verticalHeader().defaultSectionSize() - self.measure_table.verticalHeader().fontMetrics().height()
+        self.issue_tree.itemClicked.connect(self.toggle_group)
+        # in place of the issue list, the text box, and the issue frame buttons when the run has no issue to show
+        self.issue_empty_label = QLabel("")
+        self.issue_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.issue_empty_label.setWordWrap(True)
+        self.issue_empty_label.hide()
         self.issue_detail = QPlainTextEdit()
         self.issue_detail.setReadOnly(True)
         issue_controls = QHBoxLayout()
@@ -990,20 +1279,24 @@ class MainWindow(QMainWindow):
         self.issue_previous_button.clicked.connect(lambda: self.step_issue(-1))
         self.issue_next_button.clicked.connect(lambda: self.step_issue(1))
         self.issue_frame_label = QLabel("")
+        self.issue_controls = QWidget()
+        issue_controls.setContentsMargins(0, 0, 0, 0)
+        self.issue_controls.setLayout(issue_controls)
         issue_controls.addWidget(self.issue_previous_button)
         issue_controls.addWidget(self.issue_frame_label, 1, Qt.AlignmentFlag.AlignCenter)
         issue_controls.addWidget(self.issue_next_button)
         issue_layout.addWidget(self.issue_tree, 1)
+        issue_layout.addWidget(self.issue_empty_label, 1)
         issue_layout.addWidget(self.issue_detail)
-        issue_layout.addLayout(issue_controls)
+        issue_layout.addWidget(self.issue_controls)
 
-        self.thumbnail = CorrelationThumbnail(self.open_large_plot, self.correlate_selected)
+        self.thumbnail = CorrelationThumbnail(self.open_large_plot)
 
         # each tab gets the full height below the Result row
         self.tabs = QTabWidget()
         self.tabs.addTab(issue_tab, "Issues")
         self.tabs.setTabToolTip(0, "Critical issues first. Select a row to go to its frames.")
-        self.tabs.addTab(self.measure_table, "Measures")
+        self.tabs.addTab(measure_tab, "Measures")
         self.tabs.addTab(self.thumbnail, "Cross-correlation")
         layout.addWidget(status_box)
         layout.addWidget(self.tabs, 1)
@@ -1018,11 +1311,8 @@ class MainWindow(QMainWindow):
         # the tables and the issue text box get the new font in the font change events, so their sizes are measured after these events
         QTimer.singleShot(0, self.refresh_table_sizes)
 
-    # the row height follows the font: the font height and the padding that Qt gave the rows at the start
+    # the issue list and the measure list get their row height from the font
     def refresh_table_sizes(self) -> None:
-        # the issue list gets its row height from the font
-        header = self.measure_table.verticalHeader()
-        header.setDefaultSectionSize(header.fontMetrics().height() + self.row_padding)
         # ISSUE_DETAIL_LINES full lines; a longer message (an error trace) scrolls
         margins = 2 * (self.issue_detail.document().documentMargin() + self.issue_detail.frameWidth())
         self.issue_detail.setMaximumHeight(round(self.issue_detail.fontMetrics().lineSpacing() * ISSUE_DETAIL_LINES + margins))
@@ -1120,7 +1410,7 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         run = self.last_runs.get(path)
-        text, color = run_label(run, self.settings["details"]) if run else ("", "")
+        text, color = run_label(run) if run else ("", "")
         status = f"  [{text}]" if run else ""
         item.setText(0, file_label(path) + status)
         item.setToolTip(0, path.relative_to(self.folder).as_posix() + status)
@@ -1138,31 +1428,8 @@ class MainWindow(QMainWindow):
             take_item.setText(0, label)
             take_item.setForeground(0, self.palette().text().color())
             return
-        # the simple view shows the verdict of the worst severity
-        text, color = (worst, STATUS_COLORS[worst]) if self.settings["details"] else (VERDICTS[worst], VERDICT_COLORS[VERDICTS[worst]])
-        take_item.setText(0, f"{label}  [{text}]")
-        take_item.setForeground(0, QColor(color))
-
-    def set_details(self, checked: bool) -> None:
-        self.settings["details"] = checked
-        save_settings(self.settings)
-        self.apply_view()
-
-    # the parts of the full view: the Cross-correlation button, the Measures and Cross-correlation tabs, and the Stream and Message
-    # columns of the issue list; the recording list and the result get the labels of the view
-    def apply_view(self) -> None:
-        details = self.settings["details"]
-        self.correlate_button.setVisible(details)
-        self.tabs.setTabVisible(self.tabs.indexOf(self.measure_table), details)
-        self.tabs.setTabVisible(self.tabs.indexOf(self.thumbnail), details)
-        header = self.issue_tree.headerItem()
-        header.setText(0, ISSUE_COLUMNS[0][0] if details else "Issue")
-        header.setToolTip(0, ISSUE_COLUMNS[0][1] if details else "What the validation found. Select a row to see more and to go to its frames.")
-        for column in (1, 3):
-            self.issue_tree.setColumnHidden(column, not details)
-        for path in self.recording_items:
-            self.refresh_item(path)
-        self.show_result(self.requested)
+        take_item.setText(0, f"{label}  [{worst}]")
+        take_item.setForeground(0, QColor(STATUS_COLORS[worst]))
 
     def toggle_take(self, item: QTreeWidgetItem) -> None:
         if item.data(0, PATH_ROLE) is None:
@@ -1178,6 +1445,7 @@ class MainWindow(QMainWindow):
         self.stop_load()
         # the previous recording is freed before the next one loads, so that only one recording is in memory
         self.requested, self.frames = path, None
+        self.issue_strip.set_count(0)
         self.depth_column.setVisible(camera_or_none(path) != "mirrorless" and path.suffix != ".mp4")
         if self.settings["auto_load"]:
             self.start_load(path)
@@ -1227,6 +1495,7 @@ class MainWindow(QMainWindow):
         self.slider.blockSignals(True)
         self.slider.setRange(0, self.frames.count - 1)
         self.slider.blockSignals(False)
+        self.issue_strip.set_count(self.frames.count)
         self.show_frame(0)
         self.statusBar().showMessage(f"{path.name}: {self.frames.count} frames")
 
@@ -1317,7 +1586,7 @@ class MainWindow(QMainWindow):
             self.show_frame(self.index)
 
     def set_task_buttons_enabled(self, enabled: bool) -> None:
-        for button in [self.validate_selected_button, self.validate_all_button, self.correlate_button]:
+        for button in [self.validate_selected_button, self.correlate_button]:
             button.setEnabled(enabled)
         self.task_bar.setVisible(not enabled)
         self.cancel_button.setVisible(not enabled)
@@ -1347,9 +1616,6 @@ class MainWindow(QMainWindow):
         if self.requested is not None:
             self.validate([self.requested])
 
-    def validate_all(self) -> None:
-        self.validate(list(self.recordings))
-
     def on_validated(self, path_text: str, run: dict[str, Any], motion: dict | None) -> None:
         path = Path(path_text)
         self.last_runs.set(path, run)
@@ -1365,22 +1631,26 @@ class MainWindow(QMainWindow):
 
     # the last run of the file: the status, the measures, and the issues with the critical issues first
     def show_result(self, path: Path | None) -> None:
-        self.measure_table.setRowCount(0)
+        self.measure_tree.clear()
         self.issue_tree.clear()
         self.issue_detail.clear()
         self.set_issue_frames([])
         run = self.last_runs.get(path) if path is not None else None
+        self.run_length_chart.show_run(run)
+        self.old_run_label.setVisible(run is not None and "measures" not in run)
         if run is None:
             self.status_label.setText("not validated")
             self.status_label.setStyleSheet("")
             self.validated_label.setText("click Validate selected" if path is not None else "")
             self.tabs.setTabText(0, "Issues")
+            self.issue_strip.set_issues([])
+            self.show_issue_text("Not validated." if path is not None else "No recording is selected.")
             return
-        text, color = run_label(run, self.settings["details"])
+        text, color = run_label(run)
         self.status_label.setText(text)
         self.status_label.setStyleSheet(f"color: {color}")
         self.validated_label.setText(f"validated {run['validated_at'].replace('T', ' ')}")
-        self.fill_measure_table(run)
+        self.fill_measure_tree(run)
         if run["error"]:
             rows = [{"check": "error", "stream": "", "frames": [], "message": run["error"].strip()}]
         else:
@@ -1394,21 +1664,20 @@ class MainWindow(QMainWindow):
             member = (issue, "critical" if run["error"] else issue_severity(issue, run["issues"]), issue_group(issue, run["issues"]))
             shown = run["error"] or issue_key(issue, run["issues"]) not in hidden
             (members if shown else hidden_members).append(member)
-        # the tab counts the issue rows of the view: in the simple view, one row can hold many issues
-        if self.settings["details"]:
-            self.fill_issue_groups(members)
-            shown_count, hidden_count = len(members), len(hidden_members)
-        else:
-            self.fill_issue_verdicts(members)
-            shown_count = len({verdict_key(*member) for member in members})
-            hidden_count = len({verdict_key(*member) for member in hidden_members})
+        self.fill_issue_groups(members)
+        self.issue_strip.set_issues([(issue, severity) for issue, severity, _ in members])
+        shown_count, hidden_count = len(members), len(hidden_members)
         self.tabs.setTabText(0, f"Issues ({shown_count}, {hidden_count} hidden)" if hidden_count else f"Issues ({shown_count})")
+        if hidden_count and not shown_count:
+            self.show_issue_text(f"No issue to show: the Settings dialog hides the {hidden_count} issues of this file.")
+        else:
+            self.show_issue_text("" if shown_count else "No issues.")
         # the first issue of the first open row
         top = next((item for item in map(self.issue_tree.topLevelItem, range(self.issue_tree.topLevelItemCount())) if item.isExpanded()), None)
         if top is not None and top.childCount():
             self.issue_tree.setCurrentItem(top.child(0))
 
-    # the full view: one row for each known group (and No group), with each issue under it
+    # the issue list: one row for each known group (and No group), with each issue under it
     def fill_issue_groups(self, members: list[tuple[dict[str, Any], str, str | None]]) -> None:
         groups: dict[str, list[tuple[dict[str, Any], str]]] = {}
         for issue, severity, group in members:
@@ -1416,9 +1685,8 @@ class MainWindow(QMainWindow):
         # the group with the worst issue first; sorted() keeps the order of the rows for groups of the same severity
         for group, members in sorted(groups.items(), key=lambda entry: min(LEVELS.index(severity) for _, severity in entry[1])):
             worst = LEVELS[min(LEVELS.index(severity) for _, severity in members)]
-            count = len(members)
             group_item = QTreeWidgetItem(self.issue_tree)
-            group_item.setText(0, f"{group}  [{worst}: {count} {'issue' if count == 1 else 'issues'}]")
+            group_item.setText(0, f"{group}  [{severity_counts_text([severity for _, severity in members])}]")
             group_item.setFirstColumnSpanned(True)
             group_item.setForeground(0, QColor(STATUS_COLORS[worst]))
             group_item.setToolTip(0, GROUP_ABOUT.get(group, "The issues that are in no known group."))
@@ -1433,63 +1701,41 @@ class MainWindow(QMainWindow):
                     item.setToolTip(column, f"{label}: {issue['message']}")
             group_item.setExpanded(True)
 
-    # the simple view: a row for each verdict (Problem, Check, and the closed Other notes row for the low issues), with one plain item
-    # for each known group and for each check and stream in no group (their issues together)
-    def fill_issue_verdicts(self, members: list[tuple[dict[str, Any], str, str | None]]) -> None:
-        entries: dict[str, list[dict[str, Any]]] = {"critical": [], "medium": [], "low": []}
-        by_key: dict[tuple, dict[str, Any]] = {}
-        for issue, severity, group in members:
-            key = verdict_key(issue, severity, group)
-            if key in by_key:
-                entry = by_key[key]
-                entry["frames"] = sorted(set(entry["frames"]) | set(issue["frames"]))
-                entry["message"] += "\n" + issue["message"]
-                continue
-            stream = f" ({issue['stream']})" if issue["stream"] and group is None else ""
-            entry = {
-                "check": group or issue["check"],
-                "stream": issue["stream"],
-                "frames": list(issue["frames"]),
-                "message": issue["message"],
-                "plain": PLAIN_TEXTS.get(group or issue["check"], (group or issue["check"]).replace("_", " ")) + stream,
-            }
-            by_key[key] = entry
-            entries[severity].append(entry)
-        for severity, title in [("critical", "Problem"), ("medium", "Check"), ("low", OTHER_NOTES)]:
-            if not entries[severity]:
-                continue
-            row_item = QTreeWidgetItem(self.issue_tree)
-            row_item.setText(0, f"{title} ({len(entries[severity])})")
-            row_item.setFirstColumnSpanned(True)
-            if title in VERDICT_COLORS:
-                row_item.setForeground(0, QColor(VERDICT_COLORS[title]))
-            else:
-                row_item.setToolTip(0, "Minor notes. They do not make the take a problem.")
-            row_item.setData(0, ISSUE_ROLE, None)
-            for entry in entries[severity]:
-                item = QTreeWidgetItem(row_item, [entry["plain"], "", frames_text(entry["frames"]), ""])
-                item.setData(0, ISSUE_ROLE, entry)
-                item.setToolTip(0, entry["plain"])
-            # the Problem and Check rows are open; the Other notes row is closed
-            row_item.setExpanded(title != OTHER_NOTES)
+    # text: the text in place of the issue list, the text box, and the issue frame buttons; an empty text shows the issue list
+    def show_issue_text(self, text: str) -> None:
+        self.issue_empty_label.setText(text)
+        self.issue_empty_label.setVisible(bool(text))
+        for widget in [self.issue_tree, self.issue_detail, self.issue_controls]:
+            widget.setVisible(not text)
 
+    # the measures under their stream, in the order of the streams in the run; a measure of an issue has the color of the issue
+    # severity and the expected value; the tooltip has the explanation, the full value, and the issue message
     # a run of an older version of the app has no measures, only the printed lines; each line fills one row
-    def fill_measure_table(self, run: dict[str, Any]) -> None:
+    def fill_measure_tree(self, run: dict[str, Any]) -> None:
         if "measures" not in run:
             for line in run["fps"]:
-                row = self.measure_table.rowCount()
-                self.measure_table.insertRow(row)
-                self.measure_table.setItem(row, 0, QTableWidgetItem(line))
-                self.measure_table.setSpan(row, 0, 1, self.measure_table.columnCount())
+                item = QTreeWidgetItem(self.measure_tree, [line])
+                item.setFirstColumnSpanned(True)
+                item.setToolTip(0, line)
             return
+        stream_items: dict[str, QTreeWidgetItem] = {}
         for values in run["measures"]:
-            row = self.measure_table.rowCount()
-            self.measure_table.insertRow(row)
+            if values["stream"] not in stream_items:
+                stream_item = QTreeWidgetItem(self.measure_tree, [values["stream"]])
+                stream_item.setFirstColumnSpanned(True)
+                stream_item.setExpanded(True)
+                stream_items[values["stream"]] = stream_item
+            issues = measure_issues(values, run["issues"])
             value = run_lengths_text(values["value"]) if values["name"] == "run lengths" else values["value"]
-            for column, text in enumerate([values["stream"], values["name"], value]):
-                item = QTableWidgetItem(text)
-                item.setToolTip(MEASURE_ABOUT.get(values["name"], ""))
-                self.measure_table.setItem(row, column, item)
+            item = QTreeWidgetItem(stream_items[values["stream"]], [values["name"], value_with_expected(value, issues)])
+            tooltip = "\n\n".join(text for text in [MEASURE_ABOUT.get(values["name"], ""), f"Value: {value}"] if text)
+            severities = [issue_severity(issue, run["issues"]) for issue in issues]
+            for issue, severity in zip(issues, severities, strict=True):
+                tooltip += f"\n\n{severity} issue: {issue['message']}"
+            for column in range(len(MEASURE_COLUMNS)):
+                item.setToolTip(column, tooltip)
+                if severities:
+                    item.setForeground(column, QColor(STATUS_COLORS[min(severities, key=LEVELS.index)]))
 
     # a group item is not an issue, so it clears the text box and the issue frames
     def select_issue(self) -> None:
@@ -1497,19 +1743,28 @@ class MainWindow(QMainWindow):
         if not items:
             return
         issue = items[0].data(0, ISSUE_ROLE)
+        self.issue_strip.set_selected(issue)
         if issue is None:
             self.issue_detail.clear()
             self.set_issue_frames([])
             return
-        # an item of the simple view has a plain text before the message of the check
-        self.issue_detail.setPlainText(f"{issue['plain']}\n\n{issue['message']}" if "plain" in issue else issue["message"])
+        self.issue_detail.setPlainText(issue["message"])
         self.set_issue_frames(issue["frames"])
         if self.issue_frames:
             self.go_to_issue_frame()
 
-    def toggle_issue_group(self, item: QTreeWidgetItem) -> None:
+    def toggle_group(self, item: QTreeWidgetItem) -> None:
         if item.parent() is None:
             item.setExpanded(not item.isExpanded())
+
+    # a click on a mark of the issue strip goes to its frame; a frame of the selected issue also sets the issue frame buttons
+    def go_to_strip_frame(self, frame: int) -> None:
+        if frame in self.issue_frames:
+            self.issue_position = self.issue_frames.index(frame)
+            self.go_to_issue_frame()
+            return
+        self.pause()
+        self.show_frame(frame)
 
     def set_issue_frames(self, frames: list[int]) -> None:
         self.issue_frames, self.issue_position = frames, 0
@@ -1575,8 +1830,14 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# the number boxes of Qt follow the number format of Windows; a Thai format gives Thai digits, so the app uses the English format
+def use_english_numbers() -> None:
+    QLocale.setDefault(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+
+
 def main() -> None:
     app = QApplication(sys.argv)
+    use_english_numbers()
     settings = load_settings()
     set_app_font_size(settings["font_point_size"])
     window = MainWindow(start_folder(sys.argv, settings))

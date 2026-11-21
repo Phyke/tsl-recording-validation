@@ -454,7 +454,7 @@ def validation_run(path: Path, loaded: Loaded) -> dict[str, Any]:
         return run | {"fps": [], "measures": [], "issues": [], "error": traceback.format_exc()}
 
 
-# one file of Validate all, from one load: the run for the history, and the motion signal for the cross-correlation (None for an
+# one file of a validation, from one load: the run for the history, and the motion signal for the cross-correlation (None for an
 # .mp4 file or an error); the loaded frames are freed when the function returns
 def validate_file(path: Path) -> tuple[dict[str, Any], dict | None]:
     try:
